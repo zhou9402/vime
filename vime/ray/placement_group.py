@@ -368,8 +368,14 @@ def _attach_rollout_manager(startup):
     if args.check_weight_update_equal and not reused:
         # This diagnostic resets initial weights. Reused engines must retain
         # their current weights until the restarted trainer replaces them.
-        ray.get(manager.check_weights.remote(action="snapshot"))
-        ray.get(manager.check_weights.remote(action="reset_tensors"))
+        ray.get(
+            manager.check_weights.remote(
+                action="snapshot",
+                selector=args.check_weight_update_selector,
+                snapshot_mode=args.check_weight_update_snapshot,
+            )
+        )
+        ray.get(manager.check_weights.remote(action="reset_tensors", selector=args.check_weight_update_selector))
     if args.offload_rollout:
         ray.get(manager.offload.remote())
     startup.num_rollout_per_epoch = num_rollout_per_epoch

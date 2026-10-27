@@ -1441,6 +1441,55 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--check-weight-update-equal", action="store_true")
             return parser
 
+        def add_weight_check_arguments(parser):
+            # Weight-sync verification (F02, port of miles@ba28991834). The main
+            # --check-weight-update-equal switch stays in add_debug_arguments.
+            parser.add_argument(
+                "--check-weight-transfer-checksum",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="SHA-256 verify every weight-update bucket send vs. what the engine "
+                "received. Defaults on under --ci-test.",
+            )
+            parser.add_argument(
+                "--check-weight-update-selector",
+                type=str,
+                default=None,
+                choices=["all", "target", "draft"],
+                help="Which weights check_weights verifies. Default: auto = 'target', plus "
+                "'draft' coverage only when a speculative draft model is configured "
+                "(--vllm-speculative-config / dspark).",
+            )
+            parser.add_argument(
+                "--check-weight-update-skip-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="Tensor-name substrings whose check_weights mismatches are downgraded "
+                "to non-fatal warnings (e.g. 'visual.').",
+            )
+            parser.add_argument(
+                "--check-weight-update-allow-quant-error",
+                action="store_true",
+                help="Allow quantized tensors to differ by ~1 ULP per side, compared in "
+                "dequantized space. Only honored with --check-weight-update-snapshot full.",
+            )
+            parser.add_argument(
+                "--check-weight-update-snapshot",
+                type=str,
+                default="hashes",
+                choices=["hashes", "full"],
+                help="Engine-side snapshot mode for check_weights: 'hashes' stores SHA-256 "
+                "only (default, no CPU copies); 'full' stores CPU clones and enables "
+                "reset_tensors restore and quant-tolerant value compare.",
+            )
+            parser.add_argument(
+                "--ci-disable-weight-update-checker",
+                action="store_true",
+                help="Opt out of the --ci-test default enabling of --check-weight-update-equal.",
+            )
+            return parser
+
         def add_network_arguments(parser):
             parser.add_argument("--http-proxy", type=str, default=None)
             parser.add_argument("--use-distributed-post", action="store_true", default=False)
@@ -1788,6 +1837,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_wandb_arguments(parser)
         parser = add_tensorboard_arguments(parser)
         parser = add_debug_arguments(parser)
+        parser = add_weight_check_arguments(parser)
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
@@ -2002,6 +2052,24 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def resolve_weight_check_args(args):
+    """Resolve weight-sync verification defaults (F02; mirrors miles
+    utils/arguments.py:1244-1258). Mutates and returns ``args``."""
+    if getattr(args, "check_weight_transfer_checksum", None) is None:
+        args.check_weight_transfer_checksum = bool(getattr(args, "ci_test", False))
+    if (
+        getattr(args, "ci_test", False)
+        and not getattr(args, "ci_disable_weight_update_checker", False)
+        and not getattr(args, "debug_rollout_only", False)
+        and not getattr(args, "debug_train_only", False)
+    ):
+        args.check_weight_update_equal = True
+    if getattr(args, "check_weight_update_selector", None) is None:
+        draft_enabled = bool(getattr(args, "vllm_speculative_config", None))
+        args.check_weight_update_selector = "all" if draft_enabled else "target"
+    return args
+
+
 def vime_validate_args(args):
     from vime.utils.ppo_utils import get_pg_loss_type
     from vime.utils.score_centering import validate_score_centering_args
@@ -2013,6 +2081,7 @@ def vime_validate_args(args):
     validate_score_centering_args(args)
     args.eval_datasets = _resolve_eval_datasets(args)
     args.dspark_enabled = (getattr(args, "vllm_speculative_config", None) or {}).get("method") == "dspark"
+    resolve_weight_check_args(args)
 
     if args.rollout_temperature <= 0:
         raise ValueError(

@@ -25,7 +25,14 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
     ray.get(rollout_manager.training_ready.remote())
 
     if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="compare"))
+        ray.get(
+            rollout_manager.check_weights.remote(
+                action="compare",
+                selector=args.check_weight_update_selector,
+                skip_list=args.check_weight_update_skip_list,
+                allow_quant_error=args.check_weight_update_allow_quant_error,
+            )
+        )
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
