@@ -12,6 +12,8 @@ from vime.utils.distributed_utils import get_gloo_group
 from vime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
+from .atomic_groups import get_hf_atomic_update_groups
+from .bucketing import assemble_atomic_update_groups, pack_units_by_size
 from .common import all_gather_params_async, named_params_and_buffers
 
 
@@ -36,27 +38,56 @@ class HfWeightIteratorDirect:
         param_info_buckets = (
             self.megatron_local_param_info_buckets if param_info_buckets is None else param_info_buckets
         )
+        atomic_update_groups = get_hf_atomic_update_groups(
+            self.model_name, q_lora_rank=getattr(self.args, "q_lora_rank", None)
+        )
 
-        for chunk_idx, megatron_local_param_infos in enumerate(
-            tqdm(param_info_buckets, disable=rank != 0, desc=progress_desc)
-        ):
-            megatron_full_params = _get_megatron_full_params(
-                megatron_local_param_infos,
-                megatron_local_weights,
-                self.args.update_weight_buffer_size,
-                self.ep_broadcast_src_rank_map,
-            )
-            if should_convert_chunk is None or should_convert_chunk(chunk_idx):
-                hf_named_tensors = self._convert_to_hf_named_tensors(
-                    megatron_full_params,
+        def unit_stream():
+            for chunk_idx, megatron_local_param_infos in enumerate(
+                tqdm(param_info_buckets, disable=rank != 0, desc=progress_desc)
+            ):
+                megatron_full_params = _get_megatron_full_params(
                     megatron_local_param_infos,
+                    megatron_local_weights,
+                    self.args.update_weight_buffer_size,
+                    self.ep_broadcast_src_rank_map,
                 )
-            else:
-                hf_named_tensors = []
-            try:
-                yield hf_named_tensors
-            finally:
-                del hf_named_tensors, megatron_full_params
+                if should_convert_chunk is None or should_convert_chunk(chunk_idx):
+                    hf_param_units = self._convert_to_hf_units(
+                        megatron_full_params,
+                        megatron_local_param_infos,
+                    )
+                else:
+                    hf_param_units = []
+                try:
+                    yield from hf_param_units
+                finally:
+                    del hf_param_units, megatron_full_params
+
+        # Re-pack the HF unit stream: atomic groups (e.g. DeepSeek q_a_proj +
+        # kv_a_proj_with_mqa) must never be split across update buckets, and
+        # fp8 weight+scale pairs (one unit) stay together by construction.
+        units = assemble_atomic_update_groups(unit_stream(), atomic_update_groups)
+        yield from pack_units_by_size(units, self.args.update_weight_buffer_size)
+
+    def _convert_to_hf_units(
+        self,
+        megatron_full_params: Sequence[torch.Tensor],
+        param_infos: Sequence[ParamInfo],
+    ):
+        """One unit per Megatron param: the HF-named tensors it converted into
+        (a plain weight, or weight + quant scales)."""
+        return [
+            convert_to_hf(
+                self.args,
+                self.model_name,
+                info.name,
+                param,
+                self.quantization_config,
+                transform_ue8m0=self.transform_ue8m0,
+            )
+            for info, param in zip(param_infos, megatron_full_params, strict=False)
+        ]
 
     def _convert_to_hf_named_tensors(
         self,
@@ -64,17 +95,8 @@ class HfWeightIteratorDirect:
         param_infos: Sequence[ParamInfo],
     ):
         hf_named_tensors = []
-        for info, param in zip(param_infos, megatron_full_params, strict=False):
-            hf_named_tensors.extend(
-                convert_to_hf(
-                    self.args,
-                    self.model_name,
-                    info.name,
-                    param,
-                    self.quantization_config,
-                    transform_ue8m0=self.transform_ue8m0,
-                )
-            )
+        for unit in self._convert_to_hf_units(megatron_full_params, param_infos):
+            hf_named_tensors.extend(unit)
         return hf_named_tensors
 
 
