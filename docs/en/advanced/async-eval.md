@@ -36,6 +36,19 @@ tolerance. `--eval-num-gpus` is not supported with external rollout engines or
 `--prefill-num-servers`; with `--vllm-config` the YAML must define exactly one
 model named `eval` covering `--eval-num-gpus` GPUs.
 
+## CheckpointEvalFn
+
+Point `--eval-function-path` at a subclass of
+`vime.rollout.checkpoint_eval.CheckpointEvalFn` to eval snapshots on a backend
+you own (an external vLLM server, a scoring service, a black-box HTTP API).
+Each eval point delivers a finished HF checkpoint directory to
+`evaluate_checkpoint(checkpoint_dir, input)`; raise `EvalSkip(reason)` to skip
+a point with attribution. Mutually exclusive with `--eval-num-gpus` (the fleet
+already owns weight delivery); requires `--eval-hf-dir`.
+`examples/eval/external_vllm_eval_fn.py` is a working implementation, and
+`retarget_args(args, router_ip, router_port, engine_gpu_counts)` redirects the
+stock eval datasets at any vLLM router.
+
 ## Behavior
 
 - The dispatcher runs on a daemon thread with its own event loop, driven from

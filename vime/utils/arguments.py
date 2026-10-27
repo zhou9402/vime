@@ -2460,6 +2460,17 @@ def vime_validate_args(args):
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
+    from vime.rollout.checkpoint_eval import is_checkpoint_eval_fn
+
+    if is_checkpoint_eval_fn(getattr(args, "eval_function_path", None)):
+        assert not getattr(args, "eval_num_gpus", 0), (
+            "A CheckpointEvalFn owns weight delivery; it is mutually exclusive with --eval-num-gpus."
+        )
+        assert getattr(args, "eval_hf_dir", None) is not None, (
+            "A CheckpointEvalFn consumes exported HF snapshots: --eval-hf-dir is required."
+        )
+        args.eval_uses_snapshots = True
+
     from vime.ray.training_recovery import configure_recovery_checkpoint, training_recovery_enabled
 
     if training_recovery_enabled(args):

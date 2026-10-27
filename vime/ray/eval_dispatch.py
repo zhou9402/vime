@@ -147,6 +147,12 @@ class _RayRolloutManagerEvalBridge:
 
         return await asyncio.to_thread(ray.get, self._actor.report_eval_skip.remote(rollout_id, reason))
 
+    def dispose(self):
+        if self._eval_runner is not None:
+            import ray
+
+            ray.get(self._eval_runner.dispose.remote())
+
 
 class _RayTrainGroupBridge:
     """Awaitable facade over RayTrainGroup onload/offload/export_hf."""
@@ -167,8 +173,9 @@ class _RayTrainGroupBridge:
 class AsyncEvalThread:
     """Hosts an EvalDispatcher event loop on a daemon thread for the sync driver."""
 
-    def __init__(self, dispatcher: EvalDispatcher):
+    def __init__(self, dispatcher: EvalDispatcher, on_close=None):
         self._dispatcher = dispatcher
+        self._on_close = on_close
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, name="eval-dispatch", daemon=True)
         self._thread.start()
@@ -187,10 +194,18 @@ class AsyncEvalThread:
         future = asyncio.run_coroutine_threadsafe(self._dispatcher.drain(), self._loop)
         future.result()
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        """Drain and stop the loop. Returns False when the thread is stuck; in
+        that case the eval runner is left alone because it may be mid-RPC."""
         self.drain()
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            logger.error("Eval dispatch thread did not stop within 30s; leaving the eval runner undisposed.")
+            return False
+        if self._on_close is not None:
+            self._on_close()
+        return True
 
 
 def create_eval_dispatcher(args, actor_model, rollout_manager) -> AsyncEvalThread:
@@ -199,17 +214,22 @@ def create_eval_dispatcher(args, actor_model, rollout_manager) -> AsyncEvalThrea
         import ray
 
         from vime.ray.eval_fleet import EvalRunner
+        from vime.rollout.checkpoint_eval import is_checkpoint_eval_fn
 
         fleet = ray.get(rollout_manager.get_eval_fleet.remote())
         if fleet is not None:
             # Driver-owned (not detached): eval engines are not part of the
             # recoverable serving topology in v1 and die with the driver.
             eval_runner = EvalRunner.remote(args, fleet["engines"], fleet["router"])
+        elif is_checkpoint_eval_fn(getattr(args, "eval_function_path", None)):
+            # A CheckpointEvalFn owns its backend; the runner just hosts it.
+            eval_runner = EvalRunner.remote(args)
         else:
             logger.warning("Snapshot eval requested but no eval fleet is configured; evals will be skipped.")
+    bridge = _RayRolloutManagerEvalBridge(rollout_manager, eval_runner)
     dispatcher = EvalDispatcher(
         args,
         _RayTrainGroupBridge(actor_model),
-        _RayRolloutManagerEvalBridge(rollout_manager, eval_runner),
+        bridge,
     )
-    return AsyncEvalThread(dispatcher)
+    return AsyncEvalThread(dispatcher, on_close=bridge.dispose)

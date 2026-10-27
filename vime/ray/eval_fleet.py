@@ -17,25 +17,18 @@ The runner is driver-owned (not detached): eval engines are not part of the
 recoverable serving topology in v1 and die with the driver.
 """
 
-import copy
 import dataclasses
 import logging
 from pathlib import Path
 
 import ray
 
+from vime.rollout.checkpoint_eval import EvalSkip  # re-exported; canonical home is checkpoint_eval
+
 logger = logging.getLogger(__name__)
 
 EVAL_MODEL_NAME = "eval"
 HF_EXPORT_MARKER = ".vime_hf_export_complete"
-
-
-class EvalSkip(Exception):
-    """Skip this eval point with attribution (eval/skipped_<reason>)."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,19 +109,40 @@ class EvalRunner:
     """Runs snapshot evals in its own process, off the RolloutManager actor.
 
     Owning a separate GenerateState singleton here also isolates eval from
-    training-side aborts and from the training concurrency semaphore.
+    training-side aborts and from the training concurrency semaphore. With a
+    CheckpointEvalFn as --eval-function-path, the fn owns its backend and the
+    fleet pin is skipped (there may be no fleet at all).
     """
 
-    def __init__(self, args, eval_engines, router: tuple[str, int]):
+    def __init__(self, args, eval_engines=None, router: tuple[str, int] | None = None):
         self.args = args
         self._eval_engines = eval_engines
         self._router = router
+        from vime.rollout.checkpoint_eval import is_checkpoint_eval_fn, retarget_args
+        from vime.rollout.base_types import RolloutFnConstructorInput
         from vime.utils.misc import load_function
 
-        self._eval_fn = load_function(args.eval_function_path)
+        self._retarget_args = retarget_args
+        self._checkpoint_fn = None
+        if is_checkpoint_eval_fn(args.eval_function_path):
+            self._checkpoint_fn = load_function(args.eval_function_path)(
+                RolloutFnConstructorInput(args=args, data_source=None)
+            )
+        else:
+            self._eval_fn = load_function(args.eval_function_path)
 
     def run(self, rollout_id: int, hf_dir: str, weight_version: str, require_marker: bool):
-        from vime.rollout.base_types import call_rollout_fn
+        import asyncio
+
+        from vime.rollout.base_types import RolloutFnEvalInput, call_rollout_fn
+
+        if self._checkpoint_fn is not None:
+            result = asyncio.run(
+                self._checkpoint_fn(
+                    RolloutFnEvalInput(rollout_id=rollout_id, weight_version=weight_version, hf_dir=hf_dir)
+                )
+            )
+            return result.data, result.metrics
 
         pin = pin_eval_fleet(self._eval_engines, hf_dir, weight_version, require_marker=require_marker)
         if pin.skip_reason is not None:
@@ -136,8 +150,15 @@ class EvalRunner:
 
         # Retarget the stock eval fns at the eval fleet's router; the URL is
         # read from args on every request, so a shallow copy suffices.
-        eval_args = copy.copy(self.args)
-        eval_args.vllm_router_ip, eval_args.vllm_router_port = self._router
+        eval_args = self._retarget_args(
+            args=self.args, router_ip=self._router[0], router_port=self._router[1], engine_gpu_counts=[]
+        )
 
         result = call_rollout_fn(self._eval_fn, eval_args, rollout_id, None, evaluation=True)
         return result.data, result.metrics
+
+    def dispose(self):
+        import asyncio
+
+        if self._checkpoint_fn is not None:
+            asyncio.run(self._checkpoint_fn.dispose())

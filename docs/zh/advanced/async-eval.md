@@ -32,6 +32,18 @@ driver 退出而销毁,容错机制不会重启它们。`--eval-num-gpus` 不支
 rollout 引擎或 `--prefill-num-servers` 同时使用;使用 `--vllm-config` 时,
 YAML 必须恰好定义一个名为 `eval`、覆盖 `--eval-num-gpus` 个 GPU 的模型。
 
+## CheckpointEvalFn
+
+将 `--eval-function-path` 指向 `vime.rollout.checkpoint_eval.CheckpointEvalFn`
+的子类,即可在你自己持有的后端(外部 vLLM 服务、打分服务、黑盒 HTTP API)上
+评测快照。每个评测点会把一个完整的 HF 检查点目录交给
+`evaluate_checkpoint(checkpoint_dir, input)`;抛出 `EvalSkip(reason)` 可按原因
+跳过该点。与 `--eval-num-gpus` 互斥(fleet 已负责权重投递);需要
+`--eval-hf-dir`。可参考实现见
+`examples/eval/external_vllm_eval_fn.py`;
+`retarget_args(args, router_ip, router_port, engine_gpu_counts)` 可把内置 eval
+数据集定向到任意 vLLM router。
+
 ## 行为
 
 - dispatcher 运行在带独立事件循环的守护线程上,由同步驱动(`train.py`)驱动;
