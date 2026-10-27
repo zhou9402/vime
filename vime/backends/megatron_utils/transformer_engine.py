@@ -93,15 +93,22 @@ def install_transformer_engine_extensions():
 
     original_weights = TEGroupedLinear._get_weight_tensors
     # Older slime Megatron patches already implement QAT inside this method.
-    if "fake_int4_quantization_ste" in original_weights.__code__.co_names:
+    co_names = original_weights.__code__.co_names
+    needs_int4 = "fake_int4_quantization_ste" not in co_names
+    needs_nvfp4 = "maybe_fake_quantize_nvfp4_weight_tensors" not in co_names
+    if not needs_int4 and not needs_nvfp4:
         return
 
     @wraps(original_weights)
     def get_weight_tensors(self):
         weights = original_weights(self)
-        if os.environ.get("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
+        if needs_int4 and os.environ.get("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
             group_size = int(os.environ.get("OPEN_TRAINING_INT4_GROUP_SIZE", "128"))
             weights = [fake_int4_quantization_ste(weight, group_size) for weight in weights]
+        if needs_nvfp4 and os.environ.get("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
+            from vime.utils.nvfp4_fake_qat import maybe_fake_quantize_nvfp4_weight_tensors
+
+            weights = maybe_fake_quantize_nvfp4_weight_tensors(weights)
         return weights
 
     TEGroupedLinear._get_weight_tensors = get_weight_tensors

@@ -169,3 +169,14 @@ Offline conversion: `python tools/convert_hf_to_mxfp8.py --model-dir <HF ckpt>
 [--extra-high-precision-layers-hf ...]`, or `--metadata-only` for a weightless
 rollout schema. BF16 and block-FP8/UE8M0 [128,128] sources are supported; the
 latter is rescaled to [1,32] without dequantizing when scales are power-of-two.
+
+## NVFP4 fake QAT (Blackwell only)
+
+NVFP4 uses E2M1 values with E4M3 block scales (group 16) plus an FP32 global
+scale. Training-time fake QAT is enabled with `--train-env-vars
+'{"OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG": "1", "NVTE_USE_FAST_MATH": "0", ...}'`
+and wraps TE grouped-expert weights via a straight-through estimator; the
+implementation is a portable pure-torch QDQ
+(`backends/megatron_utils/kernels/nvfp4_qdq_torch.py`) validated against the
+`quant_ref` oracle — miles' SM10x-only CuTe-DSL kernel is not ported. TE's
+`NVTE_NVFP4_4OVER6*` knobs are honored. NVFP4 has no ROCm support.

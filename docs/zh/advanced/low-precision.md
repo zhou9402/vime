@@ -167,3 +167,13 @@ Blackwell（SM100+），不支持 ROCm。
 [--extra-high-precision-layers-hf ...]`，或用 `--metadata-only` 生成无权重
 rollout schema。支持 BF16 与块 FP8/UE8M0 [128,128] 源；当缩放为 2 的幂时，
 后者无需反量化即可重缩放为 [1,32]。
+
+## NVFP4 fake QAT（仅 Blackwell）
+
+NVFP4 使用 E2M1 数值、E4M3 块缩放（组大小 16）以及 FP32 全局缩放。训练侧
+fake QAT 通过 `--train-env-vars '{"OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG": "1",
+"NVTE_USE_FAST_MATH": "0", ...}'` 启用，以直通估计器包装 TE 分组专家权重；
+实现为可移植的纯 torch QDQ
+（`backends/megatron_utils/kernels/nvfp4_qdq_torch.py`），并已对照
+`quant_ref` 基准校验——miles 的 SM10x 专属 CuTe-DSL kernel 未移植。支持
+TE 的 `NVTE_NVFP4_4OVER6*` 开关。NVFP4 不支持 ROCm。
