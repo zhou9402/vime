@@ -95,3 +95,10 @@ python tools/trace_timeline_viewer.py /path/to/debug/rollout_0.pt
 ```
 
 默认路径不需要单独保存 `ReqTimeStats(...)` 日志，也不需要 Loki 或 compact 工具。
+
+## 环境报告（env_report）
+
+`vime/observability/env_report.py` 在启动时（可选周期性）记录 argv、环境变量、pip 包和可编辑安装的
+git 状态（commit + dirty hash）。argv 和环境变量中的密钥会被哈希脱敏（`redacted-sha256:<16 hex>`）。
+参数：`--env-report`（launcher JSON 记录路径，默认 `$VIME_SCRIPT_ENV_REPORT`）和
+`--env-report-interval-seconds`（默认 3600；非正数表示只在启动时报告一次）。

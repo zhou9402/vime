@@ -1397,6 +1397,27 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
+        # env report
+        def add_env_report_arguments(parser):
+            import os
+
+            parser.add_argument(
+                "--env-report",
+                type=str,
+                default=os.environ.get("VIME_SCRIPT_ENV_REPORT", ""),
+                help="Path to a launcher JSON record to embed in this process's environment report.",
+            )
+            parser.add_argument(
+                "--env-report-interval-seconds",
+                type=float,
+                default=3600.0,
+                help=(
+                    "Interval between periodic environment reports. "
+                    "Non-positive values report only once at startup."
+                ),
+            )
+            return parser
+
         # debug
         def add_debug_arguments(parser):
             parser.add_argument(
@@ -1822,6 +1843,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_mtp_training_arguments(parser)
         parser = add_dspark_training_arguments(parser)
         parser = add_ci_arguments(parser)
+        parser = add_env_report_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         reset_arg(
             parser,

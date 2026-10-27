@@ -97,3 +97,11 @@ python tools/trace_timeline_viewer.py /path/to/debug/rollout_0.pt
 ```
 
 The default path does not require separate `ReqTimeStats(...)` logs, Loki, or a compaction tool.
+
+## Environment report
+
+`vime/observability/env_report.py` logs a startup (and optional periodic) snapshot of argv, env
+vars, pip packages, and git state (commit + dirty hash) of editable installs. Secrets in argv and
+env vars are hash-redacted (`redacted-sha256:<16 hex>`). Flags: `--env-report` (launcher JSON
+record path, default `$VIME_SCRIPT_ENV_REPORT`) and `--env-report-interval-seconds` (default
+3600; non-positive = report once at startup).
