@@ -20,3 +20,14 @@ python tests/ci/flops_oracle/verify_flops.py --impl vime/utils/flops_model.py
 
 退出码 0 表示通过（实现文件尚不存在时输出 SKIP 并通过）；退出码 1
 表示不一致。
+
+## MFU 指标
+
+`log_perf_data` 每个 rollout 记录 `perf/actor_train_mfu`（以及
+`perf/mfu_peak_tflops` 和 `perf/actor_train_tflops_hf`），同时保留不变的
+slime 原有 `perf/actor_train_tflops`。MFU 分子来自 HF-config FLOPs 模型
+（对 `args.hf_checkpoint` 调用 `model_flops_from_hf_config`，按 checkpoint
+缓存）；分母优先取 `--mfu-peak-tflops`，否则查
+`vime/utils/device_flops.py` 内置设备表（NVIDIA A100/H100/H200/GH200/
+B200/B300/GB200/GB300 与 AMD MI300X/MI325X/MI355X）。两者都不可得时不记录
+`perf/mfu*` 指标。

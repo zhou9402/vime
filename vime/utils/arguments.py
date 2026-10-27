@@ -1743,6 +1743,19 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_perf_arguments(parser):
+            parser.add_argument(
+                "--mfu-peak-tflops",
+                type=float,
+                default=None,
+                help=(
+                    "Peak dense BF16 TFLOP/s of one training GPU, the denominator of perf/actor_train_mfu. "
+                    "Defaults to the built-in table in vime/utils/device_flops.py keyed on the device name; "
+                    "if neither is available, MFU is not logged."
+                ),
+            )
+            return parser
+
         def add_ci_arguments(parser):
             parser.add_argument(
                 "--ci-test",
@@ -1793,6 +1806,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
         parser = add_dspark_training_arguments(parser)
+        parser = add_perf_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         reset_arg(

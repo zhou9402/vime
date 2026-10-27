@@ -1,6 +1,7 @@
 import logging
 from argparse import Namespace
 from copy import deepcopy
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -9,10 +10,25 @@ import torch.distributed as dist
 from vime.observability import logging_utils
 from vime.observability.metric_utils import compute_pass_rate, compute_rollout_step
 from vime.observability.timer import Timer
+from vime.utils.device_flops import local_peak_bf16_tflops
+from vime.utils.flops_model import model_flops_from_hf_config
 from vime.utils.flops_utils import calculate_fwd_flops
 from vime.utils.types import RolloutBatch
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=4)
+def _mfu_model_flops(hf_checkpoint: str):
+    """HF-config FLOPs model for MFU accounting, cached per checkpoint; None when unsizable."""
+    from transformers import AutoConfig
+
+    try:
+        hf_config = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+        return model_flops_from_hf_config(hf_config)
+    except Exception as exc:  # noqa: BLE001 - accounting must never break training
+        logger.warning(f"MFU disabled: cannot size FLOPs for {hf_checkpoint}: {exc}")
+        return None
 
 
 def reduce_train_step_metrics(
@@ -400,6 +416,21 @@ def log_perf_data(
         if total_time > 0:
             log_dict["perf/step_time"] = total_time
             log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
+
+    # MFU from the analytical HF-config FLOPs model (miles port). The slime-origin
+    # perf/actor_train_tflops above is left unchanged; this logs alongside it.
+    # MFU uses the same seq_lens / world-size normalization as
+    # perf/actor_train_tflops; the two must always change together.
+    if "perf/actor_train_time" in log_dict and log_dict["perf/actor_train_time"] > 0:
+        peak_tflops = getattr(args, "mfu_peak_tflops", None) or local_peak_bf16_tflops()
+        model_flops = _mfu_model_flops(getattr(args, "hf_checkpoint", "") or "")
+        if peak_tflops and model_flops is not None:
+            train_tflops = (
+                model_flops.train_flops(timer_instance.seq_lens) / dist.get_world_size() / 1e12 / log_dict["perf/actor_train_time"]
+            )
+            log_dict["perf/mfu_peak_tflops"] = peak_tflops
+            log_dict["perf/actor_train_tflops_hf"] = train_tflops
+            log_dict["perf/actor_train_mfu"] = train_tflops / peak_tflops
 
     logger.info(f"perf {rollout_id}: {log_dict}")
 

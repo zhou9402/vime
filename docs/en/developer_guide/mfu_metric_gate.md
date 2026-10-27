@@ -23,3 +23,14 @@ python tests/ci/flops_oracle/verify_flops.py --impl vime/utils/flops_model.py
 
 Exit code 0 means pass (or SKIP while the implementation file does not exist
 yet); exit code 1 means mismatch.
+
+## MFU metric
+
+`log_perf_data` logs `perf/actor_train_mfu` (plus `perf/mfu_peak_tflops` and
+`perf/actor_train_tflops_hf`) per rollout, alongside the slime-origin
+`perf/actor_train_tflops`, which is unchanged. The MFU numerator comes from the
+HF-config FLOPs model (`model_flops_from_hf_config` on `args.hf_checkpoint`,
+cached per checkpoint); the denominator is `--mfu-peak-tflops` when set, else
+the built-in device table in `vime/utils/device_flops.py` (NVIDIA A100/H100/
+H200/GH200/B200/B300/GB200/GB300 and AMD MI300X/MI325X/MI355X). When neither is
+available for the local device, no `perf/mfu*` keys are logged.
