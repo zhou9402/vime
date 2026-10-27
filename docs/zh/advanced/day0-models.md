@@ -31,3 +31,12 @@ vime 将 miles 的 day-0 模型覆盖移植为 Megatron 训练侧插件，位于
 训练侧：`vime/backends/megatron_utils/indexer_replay.py` 按 microbatch 顺序填充逐层回放队列
 （THD token 位置重定基、zigzag CP、SP 切片）。当前限制：不支持磁盘驻留（TensorRef）的
 indexer 负载，也不支持 allgather_cp；两者都会显式报错。
+
+## Kimi-K3（`vime_plugins/models/kimi_k3/`）
+
+- `--spec vime_plugins.models.kimi_k3 get_kimi_k3_spec`；KDA（线性注意力）层为非 %4 层，
+  其余为 MLA。
+- 共享组件：`vime_plugins/models/linear_attn.py`（TP/CP 分片的 GDN/KDA 基类）、
+  `vime/backends/megatron_utils/megatron_to_hf/linear_attn_layout.py`（group-major QKV 布局）。
+- 转换器：内置 `kimi_k3` loader/exporter（嵌套 `language_model.model.*` HF 命名），
+  以及 `--hf-to-megatron-load-mode mbridge` 下的 `kimi_k3` bridge。

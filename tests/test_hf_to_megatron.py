@@ -531,6 +531,7 @@ def test_loader_scope_stays_explicit():
         "glm4_moe_lite",
         "glm_moe_dsa",
         "kimi_k2",
+        "kimi_k3",
         "llama",
         "mimo",
         "minimax_m2",

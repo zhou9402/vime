@@ -31,3 +31,12 @@ ROCm images do not carry the vLLM patch yet (needs a rebase against the ROCm nig
 Trainer-side: `vime/backends/megatron_utils/indexer_replay.py` fills the per-layer replay
 queues in microbatch order (THD token-position rebase, zigzag CP, SP slicing). Current limits:
 no disk-backed (TensorRef) indexer payloads and no allgather_cp yet; both raise loudly.
+
+## Kimi-K3 (`vime_plugins/models/kimi_k3/`)
+
+- `--spec vime_plugins.models.kimi_k3 get_kimi_k3_spec`; KDA (linear-attention) layers are the
+  non-%4 layers, MLA otherwise.
+- Shared helpers: `vime_plugins/models/linear_attn.py` (TP/CP-sharded GDN/KDA base),
+  `vime/backends/megatron_utils/megatron_to_hf/linear_attn_layout.py` (group-major QKV layout).
+- Converters: builtin `kimi_k3` loader/exporter (nested `language_model.model.*` HF names),
+  plus the `kimi_k3` mbridge bridge for `--hf-to-megatron-load-mode mbridge`.
