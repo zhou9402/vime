@@ -6,6 +6,7 @@ from vime.kernels.attention.dsa.indexer import (
     indexer_topk_scores,
     lighting_indexer,
 )
+from vime.kernels.attention.dsa.sparse_attention import sparse_attention
 from vime.kernels.attention.dsa.topk import get_dsa_topk_fn
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "indexer_logits_sbhd",
     "indexer_topk_scores",
     "lighting_indexer",
+    "sparse_attention",
 ]
