@@ -7,3 +7,5 @@ Current status:
 - **F04-0**: equivalence verifier `tests/test_lora_equivalence.py` — merged-LoRA logits must equal adapter-applied logits on a 2-layer tiny model; adapter export/import and trainer→engine sync must be bitwise identical (tamper detection included). Run: `python -m pytest tests/test_lora_equivalence.py -x -q`.
 
 Training-side LoRA (Megatron, native path) and vLLM adapter loading/sync land in subsequent PRs.
+
+- **F04-1**: engine-agnostic helper package `vime/utils/lora/` (`utils.py`: `LORA_ADAPTER_NAME="vime_lora"`, gating predicates, `save_adapter_to_disk`, `build_lora_config`; `hf_lora_targets.py`: per-model-type HF-namespace target layouts and resolution). Tests: `tests/utils/lora/`.
