@@ -49,3 +49,8 @@ def log(args, metrics, step_key: str):
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
         _TensorboardAdapter(args).log(data=metrics_except_step, step=metrics[step_key])
+
+    # CI metric-history capture: no-op unless VIME_CI_GATE_RECORD_DIR is set.
+    from vime.observability.ci_metric_history import record_from_log
+
+    record_from_log(metrics, step_key)

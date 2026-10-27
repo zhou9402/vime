@@ -1784,6 +1784,17 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
             )
+            parser.add_argument(
+                "--metric-history-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path of the metric-history gate SQLite store. Falls back to the "
+                    "VIME_METRIC_HISTORY_PATH environment variable, then to "
+                    "'metric_history.db' under the current directory. Used by "
+                    "tests/ci/metric_history/run_gate.py."
+                ),
+            )
             return parser
 
         # Add custom arguments in front to prevent overwritten some vime arguments.

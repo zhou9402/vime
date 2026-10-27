@@ -40,3 +40,27 @@ B200/B300/GB200/GB300 与 AMD MI300X/MI325X/MI355X）。两者都不可得时不
 信任标记在 run 级别，可通过 `mark_untrusted`（按 `run_id`、`ci_run_id`
 或 `commit_sha`）撤销。provenance 列使用 CI 中性命名（`ci_run_id` =
 Buildkite build 号，`ci_run_attempt` = 重试次数，`pipeline` = pipeline 名）。
+
+## 指标历史门（采集与评估）
+
+CI 设置 `VIME_CI_GATE_RECORD_DIR` 后，每次 `logging_utils.log()` 都会把白名单
+指标（`train/grad_norm`、`train/ppo_kl`、`train/train_rollout_logprob_abs_diff`、
+`train/train_rollout_kl`、`rollout/raw_reward`、两个
+`rollout/tito_session_mismatch_rate/*` 以及 `perf/actor_train_mfu`）写入
+每进程一份的 JSONL 快照（临时文件 + rename 原子替换；非有限值序列化为
+`"NaN"`/`"Infinity"`/`"-Infinity"` 标记）。
+
+测试通过顶层声明接入门控（AST 解析，运行时是 no-op）：
+
+```python
+register_ci_gate(metric_key="rollout/raw_reward")  # 阈值取自 GATE_DEFAULTS
+register_ci_gate(metric_key="perf/actor_train_mfu")  # 只记录不判定
+```
+
+`tests/ci/metric_history/run_gate.py` 合并记录，把每个 spec 与最近 20 次
+可信 baseline 的均值比较；当被强制的 spec 出错、或在至少 10 条 baseline
+下失败时退出码为 1。存储路径依次取 `--db` / `--metric-history-path`、
+`$VIME_METRIC_HISTORY_PATH`、`./metric_history.db`。`--write-baseline`
+写入可信历史（仅定时构建使用）；`--mark-untrusted-sha SHA` 撤销某个坏
+commit 的全部历史。端到端自检：
+`python tests/ci/metric_history/verify_gate_e2e.py`。

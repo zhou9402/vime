@@ -44,3 +44,27 @@ coordinate is `(metric_key, step)`; trust is a run-level flag revocable via
 `mark_untrusted` (by `run_id`, `ci_run_id`, or `commit_sha`). Provenance
 columns use CI-neutral names (`ci_run_id` = Buildkite build number,
 `ci_run_attempt` = retry count, `pipeline` = pipeline slug).
+
+## Metric-history gate (capture + evaluation)
+
+When the CI harness sets `VIME_CI_GATE_RECORD_DIR`, every `logging_utils.log()`
+call captures the whitelisted metrics (`train/grad_norm`, `train/ppo_kl`,
+`train/train_rollout_logprob_abs_diff`, `train/train_rollout_kl`,
+`rollout/raw_reward`, the two `rollout/tito_session_mismatch_rate/*` keys, and
+`perf/actor_train_mfu`) into a per-process JSONL snapshot (atomic temp+rename;
+non-finite values become `"NaN"`/`"Infinity"`/`"-Infinity"` markers).
+
+A test opts into gating with a top-level declaration, parsed from the AST:
+
+```python
+register_ci_gate(metric_key="rollout/raw_reward")  # band filled from GATE_DEFAULTS
+register_ci_gate(metric_key="perf/actor_train_mfu")  # tracked, never judged
+```
+
+`tests/ci/metric_history/run_gate.py` merges the records, evaluates each spec
+against the mean of up to 20 trusted baselines, and exits 1 when an enforced
+spec errors or fails with at least 10 baselines. The store path comes from
+`--db` / `--metric-history-path`, else `$VIME_METRIC_HISTORY_PATH`, else
+`./metric_history.db`. `--write-baseline` records trusted history (scheduled
+builds only); `--mark-untrusted-sha SHA` revokes a bad commit's runs. The
+end-to-end check is `python tests/ci/metric_history/verify_gate_e2e.py`.
