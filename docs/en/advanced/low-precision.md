@@ -180,3 +180,10 @@ implementation is a portable pure-torch QDQ
 (`backends/megatron_utils/kernels/nvfp4_qdq_torch.py`) validated against the
 `quant_ref` oracle — miles' SM10x-only CuTe-DSL kernel is not ported. TE's
 `NVTE_NVFP4_4OVER6*` knobs are honored. NVFP4 has no ROCm support.
+
+Offline conversion: `python tools/convert_hf_to_nvfp4.py --model-dir <HF ckpt>
+--save-dir <out> [--num-layers-at-start-in-bf16 N] [--num-layers-at-end-in-bf16 N]
+[--extra-high-precision-layers-hf ...]`. Only MoE routed-expert GEMMs in the
+main language decoder are quantized (gate/up share one global scale); MTP,
+shared experts and dense layers stay BF16. Live weight sync re-quantizes via
+`megatron_to_hf/processors/quantizer_nvfp4.py` in the same layout.

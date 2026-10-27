@@ -177,3 +177,9 @@ fake QAT 通过 `--train-env-vars '{"OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG": "1",
 （`backends/megatron_utils/kernels/nvfp4_qdq_torch.py`），并已对照
 `quant_ref` 基准校验——miles 的 SM10x 专属 CuTe-DSL kernel 未移植。支持
 TE 的 `NVTE_NVFP4_4OVER6*` 开关。NVFP4 不支持 ROCm。
+
+离线转换：`python tools/convert_hf_to_nvfp4.py --model-dir <HF ckpt>
+--save-dir <out> [--num-layers-at-start-in-bf16 N] [--num-layers-at-end-in-bf16 N]
+[--extra-high-precision-layers-hf ...]`。仅量化主语言解码器中的 MoE 路由专家
+GEMM（gate/up 共享同一全局缩放）；MTP、共享专家与 dense 层保持 BF16。在线
+权重同步通过 `megatron_to_hf/processors/quantizer_nvfp4.py` 以相同布局重新量化。
