@@ -21,3 +21,5 @@ vime 正在从 miles 移植 LoRA 支持（`miles@ba28991834`，移植编号 F04�
 - **F04-3d**：MoE adapter——`native/modules/moe.py`（`LoRAGroupedFC1/FC2`、shared-experts adapter）与 `native/spec/moe.py`；移植 miles 的 `test_merge.py`（合并权重 delta 必须复现前向 delta，含 MLA 与分组 experts）。rollout 侧 expert LoRA 仍由 F04-2 的校验关闭。
 
 - **F04-3e**：注册表与入口——`native/registry.py`（`MODEL_SPECS`、`resolve_adapter_targets`、`validate_native_lora_args`、`preflight_native_lora`）、`native/lora.py`（`apply_native_lora`、`wrap_model_provider_with_lora`）、包导出与 `megatron_to_hf.converter_model_name` 桥接。测试：`test_registry.py`（架构守卫、target 契约、attach 遍历、运行配置校验）。
+
+- **F04-4**：Megatron 训练侧接线——`vime/backends/megatron_utils/lora/utils.py`（复制 adapter 参数的梯度规约、adapter 发现、保存/恢复）及 `vime/backends/megatron_utils/model.py` 钩子：actor 的 provider 经 `wrap_model_provider_with_lora` 包装；LoRA 开启时 `finalize_model_grads` 增加已标记 adapter 的 TP/EP 求和；`--lora-adapter-path` 在基座 checkpoint 之后恢复（其 iteration 覆盖 rollout 编号）。注意：colocate `--offload-train` + LoRA 会明确报错，因为 vime 锁定的 Megatron 没有 fork 的 `disable_*_cpu_backup` ddp_config 字段。

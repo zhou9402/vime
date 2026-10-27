@@ -33,6 +33,14 @@ from vime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
+from .lora.native import wrap_model_provider_with_lora
+from .lora.utils import (
+    is_lora_enabled,
+    patch_param_grad_buffer_for_colocate_mode_lora,
+    reduce_marked_lora_grads,
+    resolve_lora_adapter_path,
+    restore_lora_adapter,
+)
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
@@ -294,7 +302,15 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+    lora_attached = is_lora_enabled(args) and role == "actor"
+    provider_func = get_model_provider_func(args, role)
+    if lora_attached:
+        provider_func = wrap_model_provider_with_lora(provider_func, args)
+        if args.offload_train:
+            patch_param_grad_buffer_for_colocate_mode_lora()
+    model = get_model(provider_func, ModelType.encoder_or_decoder)
+    for model_chunk in model:
+        model_chunk.lora_attached = lora_attached
 
     if args.num_rollout == 0:
         args.no_load_optim = True
@@ -755,6 +771,12 @@ def train_one_step(
     return {}, grad_norm
 
 
+def _finalize_model_grads_with_lora(model, *args, **kwargs):
+    """finalize_model_grads plus the TP/EP sum of replicated LoRA adapter grads (native LoRA)."""
+    reduce_marked_lora_grads(model)
+    return finalize_model_grads(model, *args, **kwargs)
+
+
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather
@@ -824,7 +846,10 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    if is_lora_enabled(args):
+        config.finalize_model_grads_func = _finalize_model_grads_with_lora
+    else:
+        config.finalize_model_grads_func = finalize_model_grads
 
     pre_hook_enabled = False
 
@@ -1067,6 +1092,11 @@ def initialize_model_and_optimizer(
         opt_param_scheduler,
         checkpointing_context={},
     )
+    if is_lora_enabled(args) and role == "actor" and resolve_lora_adapter_path(args) is not None:
+        # The adapter's saved iteration overrides the base checkpoint's for rollout numbering.
+        adapter_iteration = restore_lora_adapter(model, args, optimizer=optimizer, opt_param_scheduler=opt_param_scheduler)
+        if adapter_iteration is not None:
+            iteration = adapter_iteration
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(args, model)
         if (args.fp16 or args.bf16) and optimizer is not None:
