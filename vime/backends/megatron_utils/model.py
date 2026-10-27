@@ -35,6 +35,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .optimizer_state_reset import reset_optimizer_states
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
@@ -835,20 +836,7 @@ def train(
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
             logger.info("Reset optimizer states")
-        for chained_optimizer in optimizer.chained_optimizers:
-            for group in chained_optimizer.optimizer.param_groups:
-                if "step" in group:
-                    group["step"] = 0
-            for state in chained_optimizer.optimizer.state.values():
-                if "step" in state:
-                    if isinstance(state["step"], torch.Tensor):
-                        state["step"].zero_()
-                    else:
-                        state["step"] = 0
-                if "exp_avg" in state:
-                    state["exp_avg"].zero_()
-                if "exp_avg_sq" in state:
-                    state["exp_avg_sq"].zero_()
+        reset_optimizer_states(optimizer)
 
     if args.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
