@@ -15,3 +15,4 @@
    ../advanced/arch-support-beyond-megatron.md
    ../advanced/model-converter-harness.md
    ../advanced/mbridge-load-mode.md
+   ../advanced/dsa-kernels.md
