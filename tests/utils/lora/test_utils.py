@@ -109,3 +109,11 @@ def test_save_adapter_to_disk_roundtrip(tmp_path):
     loaded = safetensors.torch.load_file(str(tmp_path / "adapter_model.safetensors"))
     assert set(loaded) == set(tensors)
     assert torch.equal(loaded["model.layers.0.self_attn.q_proj.lora_A.weight"], tensors["model.layers.0.self_attn.q_proj.lora_A.weight"])
+
+
+def test_rollout_model_name_routes_to_adapter():
+    from vime.utils.lora.utils import LORA_ADAPTER_NAME, rollout_model_name
+
+    assert rollout_model_name(_args(hf_checkpoint="/tmp/m")) == "/tmp/m"
+    assert rollout_model_name(_args(lora_rank=8, hf_checkpoint="/tmp/m")) == LORA_ADAPTER_NAME
+    assert rollout_model_name(_args(lora_rank=8, lora_train_only=True, hf_checkpoint="/tmp/m")) == "/tmp/m"

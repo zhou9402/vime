@@ -17,6 +17,7 @@ from vime.backends.vllm_utils.external import get_server_info
 from vime.backends.vllm_utils.server_control import unregister_worker
 from vime.ray.ray_actor import RayActor
 from vime.utils.http_utils import _wrap_ipv6, get_host_info
+from vime.utils.lora.utils import LORA_ADAPTER_NAME, engine_loads_adapter_from_disk, lora_rollout_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,9 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
     env["HIP_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
     env.setdefault("VLLM_SERVER_DEV_MODE", "1")
     env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    if lora_rollout_enabled(args):
+        # Gates /v1/load_lora_adapter (vLLM runtime LoRA updating) for the F04-7 disk sync.
+        env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     if getattr(args, "vllm_enable_deterministic_inference", False):
         env["VLLM_BATCH_INVARIANT"] = "1"
     if getattr(args, "colocate", False):
@@ -763,6 +767,23 @@ def _compute_server_args(
         kwargs["weight_transfer_config"] = {"backend": "ipc"}
     else:
         kwargs["weight_transfer_config"] = {"backend": "nccl"}
+
+    if lora_rollout_enabled(args):
+        # vLLM serves each adapter under its name; the trainer pushes weights via F04-7 sync.
+        kwargs["enable_lora"] = True
+        kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
+        kwargs["max_loras"] = 1
+        if engine_loads_adapter_from_disk(args):
+            # Only when no trainer will push the adapter (debug rollout / skipped weight update).
+            kwargs["lora_modules"] = [
+                {
+                    "name": LORA_ADAPTER_NAME,
+                    "path": str(args.lora_adapter_path),
+                    "base_model_name": str(args.hf_checkpoint),
+                }
+            ]
+        else:
+            logger.info("Skipping startup lora_modules: the trainer pushes the adapter in the first weight sync")
 
     if worker_type == "encoder":
         # vLLM EPD producers have no language-model KV cache groups. Prefix

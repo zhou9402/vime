@@ -1068,3 +1068,4 @@ def test_make_request_short_circuits_on_headless(vllm_engine, monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+

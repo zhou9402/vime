@@ -27,3 +27,5 @@ vime 正在从 miles 移植 LoRA 支持（`miles@ba28991834`，移植编号 F04�
 - **F04-5**：仅 adapter 的 checkpoint——`vime/backends/megatron_utils/checkpoint.py` 的 `save_checkpoint` 对 LoRA 模型走 `save_lora_checkpoint`，写入 `<save>/iter_NNNNNNN/adapter/`（按 rank 的 `adapter_megatron_rank*.pt`、可选 `training_state_rank*.pt`、`adapter_config.json`）并更新 `latest_checkpointed_iteration.txt`；冻结的基座不再重复保存。恢复方式 = `--load <基座>` + `--lora-adapter-path <save>/iter_NNNNNNN/adapter`。测试：`tests/backends/megatron_utils/test_lora_checkpoint.py`。
 
 - **Review 修复**：LoRA checkpoint 不再触碰 Megatron 的 tracker——进度记录于 `<save>/latest_lora_iteration.txt`；恢复可用 `--lora-adapter-path <save>/iter_NNNNNNN/adapter` 或从 `--save` 自动解析。`--lora-rank>0` 与 `--offload-train` 在参数校验阶段即被拒绝。LoRA 参数校验改用 `ValueError`。`vime/utils/hf_utils/` 与 miles 逐字一致（仅改 import 前缀；DeepseekV4 的 sglang 分支改为 `NotImplementedError`）。
+
+- **F04-6**：vLLM 引擎启用——`_compute_server_args` 设置 `enable_lora/max_lora_rank/max_loras`（`lora_modules` 仅 debug 磁盘加载）；引擎子进程注入 `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`；rollout 请求经 `rollout_model_name` 路由到 adapter（服务名 `vime_lora`）。测试：`tests/utils/test_vllm_engine_lora.py` 与 `rollout_model_name` 谓词测试。

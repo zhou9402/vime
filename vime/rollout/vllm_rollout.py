@@ -24,6 +24,7 @@ from vime.utils.async_utils import AsyncPacer, run
 from vime.utils.data import Dataset
 from vime.utils.eval_config import EvalDatasetConfig
 from vime.utils.http_utils import get, get_rollout_num_engines, post
+from vime.utils.lora.utils import rollout_model_name
 from vime.utils.misc import SingletonMeta, load_function
 from vime.utils.processing_utils import (
     build_multimodal_messages,
@@ -441,14 +442,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     if messages:
         render_payload = {
-            "model": args.hf_checkpoint,
+            "model": rollout_model_name(args),
             "messages": messages,
         }
         ec_transfer_params = await prime_encoder(args, render_payload["messages"])
         render_url = f"{base}/v1/chat/completions/render"
         with trace_span(sample, "vllm_mm_render", attrs={"model": args.hf_checkpoint}):
             render_data = await post(render_url, render_payload, headers=headers)
-        generate_body = _mm_render_response_to_generate_body(render_data, args.hf_checkpoint)
+        generate_body = _mm_render_response_to_generate_body(render_data, rollout_model_name(args))
         if ec_transfer_params:
             generate_body["ec_transfer_params"] = ec_transfer_params
         canonical_token_ids = _coerce_flat_int_token_ids(sample.tokens)
@@ -462,7 +463,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     else:
         url = f"{base}/inference/v1/generate"
         payload = {
-            "model": args.hf_checkpoint,
+            "model": rollout_model_name(args),
             "token_ids": list(prompt_ids),
             "sampling_params": inference_sampling_params,
         }

@@ -18,8 +18,8 @@ def is_lora_weight_name(name: str) -> bool:
 
 
 def is_lora_enabled(args: Namespace) -> bool:
-    """Check if LoRA is enabled based on arguments."""
-    return args.lora_rank > 0 or args.lora_adapter_path is not None
+    """Check if LoRA is enabled based on arguments (tolerates namespaces without LoRA flags)."""
+    return getattr(args, "lora_rank", 0) > 0 or getattr(args, "lora_adapter_path", None) is not None
 
 
 def lora_rollout_enabled(args: Namespace) -> bool:
@@ -28,12 +28,14 @@ def lora_rollout_enabled(args: Namespace) -> bool:
     Gates everything rollout-facing: the engine's ``enable_lora``, the per-request
     ``lora_path``, and the adapter weight sync. Training-side LoRA is unaffected.
     """
-    return is_lora_enabled(args) and not args.lora_train_only
+    return is_lora_enabled(args) and not getattr(args, "lora_train_only", False)
 
 
 def engine_loads_adapter_from_disk(args: Namespace) -> bool:
     """Only when no trainer will push the adapter; otherwise the first weight sync carries it."""
-    return args.lora_adapter_path is not None and (args.debug_rollout_only or args.debug_skip_weight_update)
+    return getattr(args, "lora_adapter_path", None) is not None and (
+        getattr(args, "debug_rollout_only", False) or getattr(args, "debug_skip_weight_update", False)
+    )
 
 
 def lora_base_cpu_backup_enabled(args: Namespace) -> bool:
@@ -79,6 +81,11 @@ def build_lora_config(args, *, target_modules):
 
 def get_adapter_target_modules(weight_names):
     return sorted({name.removeprefix("base_model.model.").rsplit(".lora_", 1)[0] for name in weight_names})
+
+
+def rollout_model_name(args: Namespace) -> str:
+    """The served model name rollout requests route to: the LoRA adapter when rollout LoRA is on."""
+    return LORA_ADAPTER_NAME if lora_rollout_enabled(args) else args.hf_checkpoint
 
 
 @dataclass(frozen=True)
