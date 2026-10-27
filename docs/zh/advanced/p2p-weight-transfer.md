@@ -1,7 +1,8 @@
 # P2P / RDMA 权重传输
 
-> 状态:训练侧 updater、传输包、verifier 与 vLLM 引擎 patch 已合入。校验/隔离加固
-> (F01-P4,随 F02)与多机 GPU e2e(F01-P5)待做。
+> 状态:已完成(F01,叠在 F02 `miles-port/f02-weight-sync-verification` 之上,
+> 复用其 `check_weights` RPC 与 `checksum_utils`)。GPU e2e:
+> `tests/test_p2p_weight_update_e2e.py`。
 
 对于**分离部署**(非 colocate)的大规模训练,NCCL 广播权重同步的开销随引擎规模增长。
 P2P 模式改为通过 RDMA(Mooncake transfer engine)直接写入各引擎。miles 的实测数据:
@@ -57,6 +58,15 @@ p2p 与 `--colocate`、LoRA、投机解码互斥(参数校验直接拒绝)。
 暂存缓冲,并以 worker RPC(经 `/collective_rpc`)暴露 `get_p2p_transfer_info` /
 `load_weights_from_staged`。后者先校验暂存字节的逐参数 SHA-256,再经模型自身的
 `load_weights` 加载。Mooncake 仅在 `--build-arg ENABLE_P2P=1` 时安装。
+
+## 加固(F01-P4,随 F02)
+
+- 逐桶 SHA-256 校验使用 F02 的共享 `checksum_utils`;`--check-weight-transfer-checksum`
+  开关(`--ci-test` 下默认开)由 F02 的 `add_weight_check_arguments` 提供。
+- 控制面查询(数据写入除外)在 `--p2p-transfer-timeout` 内重试瞬时错误
+  (`vime/utils/retry_utils.py`,miles #4402  lineage)。
+- 出错引擎在所有训练 rank 间做并集隔离(gloo all-gather),随后走引擎现有的
+  shutdown 路径(router 注销 + 进程终止),更新随即报错。
 
 ## Verifier
 

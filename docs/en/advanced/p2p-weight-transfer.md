@@ -1,8 +1,8 @@
 # P2P / RDMA Weight Transfer
 
-> Status: trainer updater, transport package, verifier, and the vLLM engine
-> patch are in. Checksum/quarantine hardening (F01-P4, with F02) and the
-> multi-node GPU e2e (F01-P5) are pending.
+> Status: complete (F01, stacked on F02 `miles-port/f02-weight-sync-verification`,
+> whose `check_weights` RPC and `checksum_utils` this feature reuses).
+> GPU e2e: `tests/test_p2p_weight_update_e2e.py`.
 
 For **disaggregated** (non-colocated) training at scale, NCCL broadcast weight
 sync cost grows with the engine world size. P2P mode instead writes weights
@@ -71,6 +71,17 @@ worker allocates one Mooncake-registered staging buffer and exposes
 via `/collective_rpc`). `load_weights_from_staged` verifies per-name SHA-256
 checksums of the staged bytes, then loads through the model's own
 `load_weights`. Mooncake is installed only with `--build-arg ENABLE_P2P=1`.
+
+## Hardening (F01-P4, with F02)
+
+- Per-bucket SHA-256 verification uses F02's shared `checksum_utils`; the
+  `--check-weight-transfer-checksum` flag (default on under `--ci-test`) lives
+  in F02's `add_weight_check_arguments`.
+- Control-plane queries (never data writes) retry transient errors up to
+  `--p2p-transfer-timeout` (`vime/utils/retry_utils.py`, miles #4402 lineage).
+- Errored engines are union-quarantined across trainer ranks (gloo all-gather),
+  then retired via the engine's existing shutdown path (router unregister +
+  process kill) before the update raises.
 
 ## Verifier
 
