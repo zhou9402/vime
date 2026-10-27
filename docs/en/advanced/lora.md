@@ -17,3 +17,5 @@ Training-side LoRA (Megatron, native path) and vLLM adapter loading/sync land in
 - **F04-3b**: native LoRA modules — `native/modules/linear.py` (`NativeLoRAAdapter`, `LoRALinear`, `LoRASplitQKV`/`FC1`, forward-hook attach), `native/modules/lm_head.py`, `native/spec/layout.py` (module layouts / fused attach). Tests: `test_modules.py` (QKV permutation, init distributions, fused-norm host contract).
 
 - **F04-3c**: architecture specs — `native/spec/{attention,mlp,lm_head}.py` (GQA/gated-GQA/MLA attention layouts, split+fused gate/up MLP) and `native/merge.py` (`MergedWeights` view for full-model HF export). Tests: `test_specs.py` (attach on bare blocks, zero-init no-op, grad flow, target selection, merge deltas).
+
+- **F04-3d**: MoE adapters — `native/modules/moe.py` (`LoRAGroupedFC1/FC2`, shared-experts adapter) + `native/spec/moe.py`; ported miles' `test_merge.py` (merged-weight deltas must reproduce forward deltas, incl. MLA and grouped experts). Rollout-side expert LoRA remains gated off (F04-2 validation).
