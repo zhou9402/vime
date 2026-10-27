@@ -23,6 +23,11 @@ from vime.utils.cleanup import Cleanup
 from vime.utils.http_utils import init_http_client
 from vime.utils.misc import load_function
 from vime.utils.staleness import fully_async_metrics_enabled
+from vime.utils.weight_version import (
+    assert_engine_weight_versions_sane,
+    assert_samples_weight_version_sane,
+    assert_weight_version_is_published,
+)
 
 from .utils import Lock, add_default_ray_env_vars
 
@@ -66,6 +71,7 @@ class RolloutManager:
         self.controller = deployment.controller if deployment else None
         self._owns_controller = False
         self.weight_version = None
+        self._rollouts_since_valid_weight_version = 0
         self.training_weight_version = getattr(args, "update_weight_start_version", 0)
         if args.rollout_data_transport == "straw":
             check_rollout_storage(args)
@@ -358,6 +364,7 @@ class RolloutManager:
                 self.batch_builder.raw_ref = batch.raw
         else:
             data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+            assert_samples_weight_version_sane(self.args, data if isinstance(data, list) else [])
             save_debug_rollout_data(
                 self.args.save_debug_rollout_data,
                 data,
@@ -550,7 +557,16 @@ class RolloutManager:
                 valid = bool(versions) and all(
                     str(version).isascii() and str(version).isdigit() for version in versions
                 )
-                self.weight_version = max(map(int, versions)) if valid else None
+                if valid:
+                    assert_engine_weight_versions_sane(self.args, versions)
+                    self.weight_version = max(map(int, versions))
+                    self._rollouts_since_valid_weight_version = 0
+                else:
+                    self.weight_version = None
+                    self._rollouts_since_valid_weight_version += 1
+                    assert_weight_version_is_published(
+                        self.args, rollouts_since_publish=self._rollouts_since_valid_weight_version
+                    )
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             if self.args.rollout_data_transport == "straw":
                 samples = getattr(data, "samples", None)
