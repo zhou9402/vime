@@ -1,0 +1,303 @@
+# Port of miles@ba28991834 tests/ci/metric_history/gate.py.
+# Adaptation: vime has no miles CIRegistry; gate identity (test_path/backend) is
+# passed explicitly, and parse_ci_gate_specs is imported lazily (F10-5 module).
+"""Offline regression gate for the CI metric-history system.
+
+* Consumes one merged per-run JSONL record plus the `register_ci_gate` specs
+  declared in the test file, and decides whether the run is *trusted*.
+* The record is the passing attempt's merged JSONL, selected and merged by the
+  harness caller (`tests.ci.ci_utils`) before the gate is invoked.
+* Each spec pairs a STEPS selection (which value(s) to pull: `"last"` /
+  `"all"` / a step list) with a CONSTRAINT (the pass/fail rule). `"all"` and a
+  step list fan out to one comparison coordinate per step, each judged only
+  against that same step's history.
+* One check runs per coordinate, using the spec's constraint: the HISTORICAL
+  gate. It is active only when the store returns >=1 trusted baseline value
+  for the (identity, coordinate), and compares against the mean of those
+  values. Zero trusted values means INACTIVE -- a cold start, not a failure.
+* A spec with constraint None is TRACKED: its value is recorded and reported
+  against the mean of its own trusted history, but never judged, so it
+  neither fails nor untrusts a run, even when the metric is missing.
+* The run is trusted iff every *active* check passed for every coordinate.
+* The gate is pure and read-only: the store is injected via
+  :class:`MetricHistoryStore` and the only store call is
+  `store.recent_trusted_values` -- no connection opened, no wandb read, no
+  rows written.
+
+Caveats:
+
+* Do not add store writes here. Persistence is the caller's job --
+  :func:`tests.ci.ci_utils.run_gate_hook` writes rows on baseline-writing runs --
+  and the gate itself stays read-only.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass, field
+from enum import Enum
+
+from metric_history.constraints import evaluate_constraint
+from metric_history.selection import SelectionError, select
+from metric_history.storage.store import MetricHistoryStore
+
+
+def _parse_specs(test_filename: str):
+    # Lazy: register.py is only needed when the caller does not inject specs.
+    from metric_history.register import parse_ci_gate_specs
+
+    return parse_ci_gate_specs(test_filename)
+
+
+HISTORY_LIMIT = 20
+MIN_ENFORCED_BASELINES = 10
+
+
+class GateStatus(Enum):
+    """Outcome of the historical check for one coordinate."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    INACTIVE = "inactive"  # check not applicable: historical cold start
+    TRACKED = "tracked"  # recorded and compared to its own history, never judged
+    ERROR = "error"  # the metric could not be selected (missing/empty series, bad step)
+
+
+@dataclass(frozen=True)
+class MetricGateResult:
+    """Per-coordinate verdict.
+
+    `(metric_key, step)` is the baseline coordinate; `steps_key` /
+    `constraint_key` name the declaration that judged it. `step` is None only
+    when selection errored (there is no coordinate to name), `-1` for a
+    whole-series reduction like `steps="last"`. `at_step` is the
+    step the value actually came from, for reporting. `current` is the
+    extracted scalar, or None when selection errored. `baseline_mean` is the
+    mean of trusted history when the historical gate is active, else None.
+    `trusted` is True iff the check here passed or was inactive.
+    """
+
+    metric_key: str
+    steps_key: str
+    constraint_key: str
+    step: int | None
+    at_step: int | None
+    current: float | None
+    historical_status: GateStatus
+    baseline_n: int
+    baseline_mean: float | None
+    reason: str
+
+    @property
+    def trusted(self) -> bool:
+        return self.historical_status in (GateStatus.PASS, GateStatus.INACTIVE, GateStatus.TRACKED)
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """Run-level verdict over every gate spec for one test file."""
+
+    test_path: str
+    backend: str
+    suite: str
+    metrics: list[MetricGateResult] = field(default_factory=list)
+
+    @property
+    def trusted(self) -> bool:
+        """The run is trusted iff every per-coordinate verdict is trusted.
+
+        An empty metrics list (no gate specs) is vacuously trusted: a file that
+        declares no gate cannot regress. One failing step of a fanned-out spec
+        untrusts the whole run.
+        """
+        return all(m.trusted for m in self.metrics)
+
+
+# Capture serializes non-finite floats as these markers so record lines stay
+# strict JSON; decode them back before extraction judges the values.
+_NONFINITE_MARKERS: dict[str, float] = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
+
+
+def _decode_value(value: object) -> object:
+    if isinstance(value, str) and value in _NONFINITE_MARKERS:
+        return _NONFINITE_MARKERS[value]
+    return value
+
+
+def parse_merged_record(record_path: str) -> dict[str, list]:
+    """Read a merged JSONL record into `{metric_key: series}`.
+
+    Each line is `{"metric": key, "series": [[step, value], ...]}`. Non-finite
+    values arrive as the capture-side string markers and are decoded back to
+    floats here. A repeated metric key (should not happen post-merge) keeps the
+    last line's series.
+    """
+    by_metric: dict[str, list] = {}
+    with open(record_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            by_metric[rec["metric"]] = [
+                [point[0], _decode_value(point[1])] if isinstance(point, list) and len(point) >= 2 else point
+                for point in rec["series"]
+            ]
+    return by_metric
+
+
+def _error_result(spec: CiGateSpec, reason: str) -> MetricGateResult:
+    tracked = spec.constraint is None
+    return MetricGateResult(
+        metric_key=spec.metric_key,
+        steps_key=spec.steps_key,
+        constraint_key=spec.constraint_key,
+        step=None,
+        at_step=None,
+        current=None,
+        historical_status=GateStatus.TRACKED if tracked else GateStatus.ERROR,
+        baseline_n=0,
+        baseline_mean=None,
+        reason=f"tracked: {reason}" if tracked else reason,
+    )
+
+
+def _evaluate_spec(
+    spec: CiGateSpec,
+    by_metric: dict[str, list],
+    store: MetricHistoryStore,
+    *,
+    test_path: str,
+    backend: str,
+    suite: str,
+    history_limit: int,
+) -> list[MetricGateResult]:
+    series = by_metric.get(spec.metric_key)
+    if series is None:
+        return [_error_result(spec, f"required metric {spec.metric_key!r} missing from record")]
+
+    try:
+        selections = select(series, spec.steps)
+    except SelectionError as e:
+        return [_error_result(spec, f"metric {spec.metric_key!r} (steps={spec.steps!r}): {e}")]
+
+    results: list[MetricGateResult] = []
+    for ex in selections:
+        trusted_values = store.recent_trusted_values(
+            test_path, backend, suite, spec.metric_key, ex.step, history_limit
+        )
+        results.append(
+            evaluate_coordinate(
+                spec, current=ex.value, step=ex.step, at_step=ex.at_step, trusted_values=trusted_values
+            )
+        )
+    return results
+
+
+def evaluate_coordinate(
+    spec: CiGateSpec,
+    *,
+    current: float,
+    step: int,
+    at_step: int | None,
+    trusted_values: list[float],
+) -> MetricGateResult:
+    """Compare one selected value; live gating and offline replay share this rule."""
+    reasons: list[str] = []
+    if spec.constraint is None:
+        baseline_mean = sum(trusted_values) / len(trusted_values) if trusted_values else None
+        if baseline_mean is None:
+            reason = f"tracked: cur={current:.6g}, no history yet"
+        elif baseline_mean == 0:
+            reason = f"tracked: cur={current:.6g} vs mean=0 (n={len(trusted_values)})"
+        else:
+            change = (current - baseline_mean) / abs(baseline_mean)
+            reason = f"tracked: cur={current:.6g} vs mean={baseline_mean:.6g} (n={len(trusted_values)}, {change:+.1%})"
+        return MetricGateResult(
+            metric_key=spec.metric_key,
+            steps_key=spec.steps_key,
+            constraint_key=spec.constraint_key,
+            step=step,
+            at_step=at_step,
+            current=current,
+            historical_status=GateStatus.TRACKED,
+            baseline_n=len(trusted_values),
+            baseline_mean=baseline_mean,
+            reason=reason,
+        )
+    if not trusted_values:
+        historical_status = GateStatus.INACTIVE
+        baseline_mean = None
+        reasons.append("historical: cold start (0 trusted baselines)")
+    else:
+        baseline_mean = sum(trusted_values) / len(trusted_values)
+        hist = evaluate_constraint(spec.constraint, current, baseline_mean)
+        historical_status = GateStatus.PASS if hist.ok else GateStatus.FAIL
+        if not hist.ok:
+            reasons.append(
+                f"historical: cur={current:.6g} vs mean={baseline_mean:.6g} "
+                f"(n={len(trusted_values)}) outside [{hist.lo:.6g}, {hist.hi:.6g}]"
+            )
+    if historical_status in (GateStatus.PASS, GateStatus.INACTIVE):
+        reasons.insert(0, "ok")
+    return MetricGateResult(
+        metric_key=spec.metric_key,
+        steps_key=spec.steps_key,
+        constraint_key=spec.constraint_key,
+        step=step,
+        at_step=at_step,
+        current=current,
+        historical_status=historical_status,
+        baseline_n=len(trusted_values),
+        baseline_mean=baseline_mean,
+        reason="; ".join(reasons),
+    )
+
+
+def evaluate_gate(
+    test_filename: str,
+    merged_record_path: str,
+    store: MetricHistoryStore,
+    *,
+    executing_suite: str,
+    backend: str = "cuda",
+    history_limit: int = HISTORY_LIMIT,
+    specs: list | None = None,
+) -> GateResult:
+    """Evaluate every gate spec for `test_filename` against a record.
+
+    Gate identity (test_path/backend/suite) is explicit: `test_path` is the
+    repo-relative test path, `backend` the hardware string ("cuda"/"rocm"/"cpu"),
+    and `executing_suite` the stage this run actually executed on. Specs are
+    injected by the harness; when `specs` is None they are parsed from the file
+    via `register.parse_ci_gate_specs` (lazy import).
+
+    `merged_record_path` is the merged per-run JSONL of the passed attempt --
+    the gate never globs a base directory to find it. `store` answers the
+    baseline query and nothing else (no writes, no connection opened here). A
+    fanned-out spec contributes one MetricGateResult per step.
+    """
+    if specs is None:
+        specs = _parse_specs(test_filename)
+    if not specs:
+        # No gate spec can regress; identity is informational here.
+        return GateResult(test_path=test_filename, backend=backend, suite=executing_suite, metrics=[])
+
+    by_metric = parse_merged_record(merged_record_path)
+
+    results: list[MetricGateResult] = []
+    for spec in specs:
+        results.extend(
+            _evaluate_spec(
+                spec,
+                by_metric,
+                store,
+                test_path=test_filename,
+                backend=backend,
+                suite=executing_suite,
+                history_limit=history_limit,
+            )
+        )
+
+    return GateResult(test_path=test_filename, backend=backend, suite=executing_suite, metrics=results)
