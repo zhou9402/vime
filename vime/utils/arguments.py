@@ -700,6 +700,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 help="Initial grace period (in seconds) before starting health checks. This allows time for model compilation and initialization. Increase this value significantly when using deepgemm.",
             )
             parser.add_argument(
+                "--rollout-health-check-failure-threshold",
+                type=int,
+                default=1,
+                help=(
+                    "Consecutive failed health checks required before an engine is retired. "
+                    "Default 1 retires on the first failure (fastest recycle); 3 is recommended "
+                    "to debounce transient probe failures."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-cleanup-timeout",
                 type=float,
                 default=60.0,

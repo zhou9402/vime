@@ -134,3 +134,10 @@ Each `TrainRayActor` carries a `SimpleHeartbeat` (`vime/utils/ft_utils/heartbeat
 dependency-free counter + timestamp bumped at the train/save/update_weights/sleep/wake_up lifecycle
 boundaries. Poll it via the actor's `get_heartbeat_status()` method to detect a wedged trainer
 without disturbing the training path.
+
+## Health-check debounce
+
+`--rollout-health-check-failure-threshold N` (default 1) requires N consecutive failed
+`/health_generate` probes before an engine is retired. A successful probe — or a monitor
+`resume()` after offload — resets the counter. Keep the default for fastest recycle of dead
+engines; use 3 to debounce transient probe failures.

@@ -135,3 +135,9 @@ rollout 过程中，vime 定期请求 vLLM 的 `/health_generate` 接口，检�
 每个 `TrainRayActor` 带一个 `SimpleHeartbeat`（`vime/utils/ft_utils/heartbeat_utils.py`）：
 零依赖的计数器 + 时间戳，在 train/save/update_weights/sleep/wake_up 生命周期边界 bump。
 通过 actor 的 `get_heartbeat_status()` 方法轮询即可发现卡死的 trainer，不影响训练路径。
+
+## 健康检查去抖
+
+`--rollout-health-check-failure-threshold N`（默认 1）要求连续 N 次 `/health_generate` 探测失败才 retire 引擎。
+探测成功或 monitor `resume()`（offload 后恢复）都会清零计数。默认 1 表示最快回收死引擎；
+要防止瞬时抖动误杀可设为 3。

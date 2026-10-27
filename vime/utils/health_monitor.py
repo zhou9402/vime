@@ -30,6 +30,8 @@ class RolloutHealthMonitor:
         self._check_interval = args.rollout_health_check_interval
         self._check_timeout = args.rollout_health_check_timeout
         self._check_first_wait = args.rollout_health_check_first_wait
+        self._failure_threshold = getattr(args, "rollout_health_check_failure_threshold", 1)
+        self._consecutive_failures: dict[int, int] = {}
         self._need_first_wait = True  # Need to wait after each resume
         self._check_lock = threading.Lock()
 
@@ -89,6 +91,8 @@ class RolloutHealthMonitor:
         """Resume health checking. Called when engines are onloaded."""
         logger.info("Resuming health monitor...")
         self._need_first_wait = True  # Need to wait after each resume
+        # Failures recorded against an offloaded engine must not count after resume.
+        self._consecutive_failures.clear()
         self._pause_event.clear()
 
     def _health_monitor_loop(self) -> None:
@@ -148,7 +152,33 @@ class RolloutHealthMonitor:
                 try:
                     ray.get(handle, timeout=0)
                 except Exception as error:
-                    # Both HTTP failures and unresponsive/dead actor RPCs retire
-                    # the engine; HTTP timeout alone cannot detect a wedged actor.
-                    logger.error("Health check failed for engine %s: %s", rollout_engine_id, error)
-                    self._server_group.retire_engine(rollout_engine_id, timeout=self._check_timeout)
+                    # Both HTTP failures and unresponsive/dead actor RPCs count
+                    # against the engine; HTTP timeout alone cannot detect a wedged actor.
+                    failures = self._consecutive_failures.get(rollout_engine_id, 0) + 1
+                    self._consecutive_failures[rollout_engine_id] = failures
+                    if failures >= self._failure_threshold:
+                        logger.error(
+                            "Health check failed for engine %s (%s/%s consecutive failures): %s",
+                            rollout_engine_id,
+                            failures,
+                            self._failure_threshold,
+                            error,
+                        )
+                        self._consecutive_failures.pop(rollout_engine_id, None)
+                        self._server_group.retire_engine(rollout_engine_id, timeout=self._check_timeout)
+                    else:
+                        logger.warning(
+                            "Health check failed for engine %s (%s/%s consecutive failures); "
+                            "retaining it for the next check: %s",
+                            rollout_engine_id,
+                            failures,
+                            self._failure_threshold,
+                            error,
+                        )
+                else:
+                    # A successful probe resets the debounce counter.
+                    self._consecutive_failures.pop(rollout_engine_id, None)
+            # Prune counters of engines that are gone (retired/rebuilt between checks).
+            live_ids = set(checks.values())
+            for stale_id in set(self._consecutive_failures) - live_ids:
+                self._consecutive_failures.pop(stale_id, None)
