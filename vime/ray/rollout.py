@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 import logging
 import time
@@ -67,6 +68,7 @@ class RolloutManager:
         self._owns_controller = False
         self.weight_version = None
         self._policy_binding = None
+        self._train_parallel_configs = {}
         self.training_weight_version = getattr(args, "update_weight_start_version", 0)
         if args.rollout_data_transport == "straw":
             check_rollout_storage(args)
@@ -330,7 +332,7 @@ class RolloutManager:
     def get_num_rollout_per_epoch(self):
         return len(self.data_source) // self.args.rollout_batch_size
 
-    def generate(self, rollout_id):
+    def generate(self, rollout_id, model_id=None):
         start_time = time.time()
         self.rollout_id = rollout_id
         self.batch_builder.rollout_id = rollout_id
@@ -341,14 +343,18 @@ class RolloutManager:
         # eligible for this internal-engine test.
         if self.serving is not None and self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self.servers = ray.get(self.serving.try_ci_fault_injection.remote())
-        result = self._generate(rollout_id, start_time)
+        result = self._generate(rollout_id, start_time, model_id=model_id)
         if self.serving is not None:
             # Refresh the local snapshot before offload/pause can target a dead
             # actor. Replacement engines are created only before weight update.
             self.servers = ray.get(self.serving.finish_rollout.remote())
         return result
 
-    def _generate(self, rollout_id, start_time):
+    def _generate(self, rollout_id, start_time, model_id=None):
+        with self._select_train_parallel_config(model_id):
+            return self._generate_impl(rollout_id, start_time, model_id=model_id)
+
+    def _generate_impl(self, rollout_id, start_time, model_id=None):
         if self.recovery is not None and rollout_id in self.recovery.batches:
             batch = self.recovery.batches[rollout_id]
             logger.info("Replaying retained rollout %s with the current trainer parallelism", rollout_id)
@@ -368,7 +374,7 @@ class RolloutManager:
             if self.args.rollout_data_transport == "straw":
                 self.batch_builder.raw_ref = batch.raw
         else:
-            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+            data, metrics = self._get_rollout_data(rollout_id=rollout_id, model_id=model_id)
             save_debug_rollout_data(
                 self.args.save_debug_rollout_data,
                 data,
@@ -516,7 +522,7 @@ class RolloutManager:
             [engine.check_weights.remote(action=action) for engine in self.rollout_engines if engine is not None]
         )
 
-    def _get_rollout_data(self, rollout_id):
+    def _get_rollout_data(self, rollout_id, model_id=None):
         if self.args.load_debug_rollout_data:
             if (
                 self.args.rollout_data_transport == "straw"
@@ -550,18 +556,20 @@ class RolloutManager:
         else:
             if fully_async_metrics_enabled(self.args):
                 # The training loop keeps serving weights fixed while collecting
-                # this batch. Query only the updatable model.
-                server = self._get_updatable_server()
+                # this batch. Query only the requesting policy's updatable model
+                # (the first updatable server in single-policy runs).
+                server = self._get_updatable_server(model_id) if model_id is not None else self._get_updatable_server()
                 engines = [engine for engine in server.engines if engine is not None] if server else []
                 versions = ray.get([engine.get_weight_version.remote() for engine in engines])
                 valid = bool(versions) and all(
                     str(version).isascii() and str(version).isdigit() for version in versions
                 )
                 self.weight_version = max(map(int, versions)) if valid else None
-                # The rollout context carries the version through any custom
-                # rollout-fn wrapping (partials, decorators) to the fully-async
-                # staleness check; no signature sniffing needed.
-                with rollout_context(rollout_id, weight_version=self.weight_version):
+                # The rollout context carries the version (and, in multi-policy
+                # runs, the policy whose groups the drain collects) through any
+                # custom rollout-fn wrapping (partials, decorators) to the
+                # fully-async staleness/policy checks; no signature sniffing.
+                with rollout_context(rollout_id, weight_version=self.weight_version, policy_id=model_id):
                     data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             else:
                 data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
@@ -591,5 +599,24 @@ class RolloutManager:
 
         return data, metrics
 
-    def set_train_parallel_config(self, config: dict):
-        self.batch_builder.train_parallel_config = config
+    def set_train_parallel_config(self, config: dict, model_id=None):
+        """Register a trainer's DP layout; per-policy in multi-policy runs."""
+        if model_id is None:
+            self.batch_builder.train_parallel_config = config
+        else:
+            self._train_parallel_configs[model_id] = config
+
+    @contextlib.contextmanager
+    def _select_train_parallel_config(self, model_id):
+        """Point the shared batch_builder at one policy's DP layout for the call."""
+        if model_id is None:
+            yield
+            return
+        if model_id not in self._train_parallel_configs:
+            raise ValueError(f"no train parallel config registered for policy {model_id!r}")
+        previous = self.batch_builder.train_parallel_config
+        self.batch_builder.train_parallel_config = self._train_parallel_configs[model_id]
+        try:
+            yield
+        finally:
+            self.batch_builder.train_parallel_config = previous

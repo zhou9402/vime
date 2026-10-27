@@ -639,7 +639,11 @@ class MegatronTrainRayActor(TrainRayActor):
             engine_gpu_counts,
             engine_gpu_offsets,
             engine_parallel_configs,
-        ) = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
+        ) = ray.get(
+            self.rollout_manager.get_updatable_engines_and_lock.remote(
+                getattr(self.args, "trainer_model_id", None)
+            )
+        )
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 

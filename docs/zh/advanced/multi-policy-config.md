@@ -23,3 +23,11 @@ trainers:
 ## leader/follower 协调
 
 `--multi-policy-config` 中第一个 trainer 是 **leader**：其 rollout 序号界定整个 run，并通过 `Parker` 屏障（`vime/utils/multi_policy/parker.py`）在全局 save/eval 临界区停住所有 follower。每个策略按自己的 rollout id 保存到 `<save>/trainers/<trainer_id>`；全局一致性记录在 `<save>/multi_policy_state/<leader_rollout_id>.json`（`MultiPolicyCheckpointState`），resume 时会断言每个策略的位置与该记录完全一致。
+
+## 训练入口（F09-4，叠加在 F05 fully-async staleness 工作之上）
+
+`train_multi_policy.py` 为每个策略起一个 asyncio task，共享一个 `RolloutManager`：每轮先 `manager.generate(rollout_id, model_id=...)`（按策略从对应 server 采样权重版本，经 `rollout_context` 传递；fully-async drain 按 `Sample.trainer_model_id` 拆分混合 group 并把其他策略的部分重新入队），再在该策略自己的 trainer group 上 `async_train`，最后只向该策略的 engine 集合发布权重。v1 限制：仅支持本地（非分布式）fully-async worker，禁止 `--colocate`、`--use-critic`；run 由 leader 的 `--num-rollout` 界定。
+
+## 端到端验证（F09-5）
+
+`tests/test_multi_policy_2policy_e2e.py`（仅 GPU CI）训练 solver/verifier 两个策略（`examples/multi_policy/generate_solver_verifier.py`），断言 `multi_policy_state/<N>.json` 记录和 `<save>/trainers/<trainer_id>` 下两个策略各自的 checkpoint；reward/grad-norm 曲线通过 F10 metric-history gate 声明做跟踪。

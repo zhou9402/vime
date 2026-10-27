@@ -249,7 +249,11 @@ class RayTrainGroup:
         assert self._rollout_manager is not None, "disk weight update requires a rollout manager."
         if self.args.offload_rollout:
             ray.get(self._rollout_manager.onload_weights.remote())
-        engines, *_ = ray.get(self._rollout_manager.get_updatable_engines_and_lock.remote())
+        engines, *_ = ray.get(
+            self._rollout_manager.get_updatable_engines_and_lock.remote(
+                getattr(self.args, "trainer_model_id", None)
+            )
+        )
         if not engines:
             if not self.args.update_weight_disk_keep_files:
                 shutil.rmtree(disk_weight_dir, ignore_errors=True)

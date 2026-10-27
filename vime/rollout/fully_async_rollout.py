@@ -38,11 +38,12 @@ from vime.data.transport import discard_rollout_group, publish_rollout_async
 from vime.rollout.async_policy import UnusedReason, async_capacity_limit, handle_unused_group
 from vime.rollout.base_types import RolloutFnTrainOutput, finalize_rollout_groups
 from vime.rollout.filter_hub.base_types import call_dynamic_filter
-from vime.rollout.sample_hooks import current_rollout_weight_version
+from vime.rollout.sample_hooks import current_rollout_policy_id, current_rollout_weight_version
 from vime.rollout.submission_scheduler import make_submission_scheduler
 from vime.rollout.vllm_rollout import GenerateState, generate_and_rm_group
 from vime.utils.async_utils import run
 from vime.utils.http_utils import get_rollout_num_engines
+from vime.utils.multi_policy.sharding import partition_group_by_policy as _partition_group_by_policy
 from vime.utils.misc import load_function
 from vime.utils.staleness import group_is_stale
 from vime.utils.types import Sample
@@ -107,6 +108,12 @@ class AsyncRolloutWorker:
         # instead, which stops topping up while a full pool of completed groups
         # is already waiting to be consumed.
         self.output_queue: queue.Queue[tuple[int, list[Sample]]] = queue.Queue()
+        # Multi-policy runs (args.multi_policy set): finished groups are split
+        # ONCE at completion time into per-policy sub-groups, held here so a
+        # drain for policy X only ever pops X's finished rollouts — nothing is
+        # regenerated or re-queued into the prompt source.
+        self._multi_policy = getattr(args, "multi_policy", None) is not None
+        self._ready_by_policy: dict[str, queue.Queue[tuple[int, list[Sample]]]] = {}
         self.poll_interval = 0.01
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
@@ -139,13 +146,19 @@ class AsyncRolloutWorker:
         if not self.admission_paused or self.active:
             raise RuntimeError("Pause generation before saving worker state")
         with self.output_queue.mutex:
-            return {"ready": list(self.output_queue.queue)}
+            ready = list(self.output_queue.queue)
+        ready_by_policy = {pid: list(q.queue) for pid, q in self._ready_by_policy.items()}
+        return {"ready": ready, "ready_by_policy": ready_by_policy}
 
     def load_state_dict(self, state):
         if self.worker_thread is not None:
             raise RuntimeError("Restore worker state before starting generation")
         for result in state["ready"]:
             self.output_queue.put(result)
+        for pid, results in state.get("ready_by_policy", {}).items():
+            policy_queue = self._ready_by_policy.setdefault(pid, queue.Queue())
+            for result in results:
+                policy_queue.put(result)
 
     def close(self):
         self.running = False
@@ -154,24 +167,31 @@ class AsyncRolloutWorker:
             if self.worker_thread.is_alive():
                 raise TimeoutError("Generation did not stop within 35 seconds")
 
-    def get_completed_groups(self, limit: int | None = None) -> list[tuple[int, list[Sample]]]:
+    def get_completed_groups(
+        self, limit: int | None = None, policy_id: str | None = None
+    ) -> list[tuple[int, list[Sample]]]:
         """Pop up to ``limit`` completed groups (all of them when ``None``).
 
-        Callers that only need a fixed number of groups must pass ``limit`` —
-        anything popped beyond it would otherwise have to be thrown away, and
-        these groups are fully generated and reward-scored, with their prompts
-        already consumed from ``data_buffer``.
+        With ``policy_id`` (multi-policy runs), pops only that policy's ready
+        queue — finished groups of other policies stay buffered for their own
+        drains. Callers that only need a fixed number of groups must pass
+        ``limit`` — anything popped beyond it would otherwise have to be thrown
+        away, and these groups are fully generated and reward-scored, with
+        their prompts already consumed from ``data_buffer``.
         """
+        source = self.output_queue if policy_id is None else self._ready_by_policy.get(policy_id)
+        if source is None:
+            return []
         completed: list[tuple[int, list[Sample]]] = []
         while limit is None or len(completed) < limit:
             try:
-                completed.append(self.output_queue.get_nowait())
+                completed.append(source.get_nowait())
             except queue.Empty:
                 break
         return completed
 
     def queue_size(self) -> int:
-        return self.output_queue.qsize()
+        return self.output_queue.qsize() + sum(q.qsize() for q in self._ready_by_policy.values())
 
     # -- internals -----------------------------------------------------------
 
@@ -213,7 +233,7 @@ class AsyncRolloutWorker:
                 queue_limit = self.capacity_limit or max_concurrent
                 while (
                     self.submission.has_capacity(pending_groups=len(active_tasks), group_budget=max_concurrent)
-                    and self.output_queue.qsize() < queue_limit
+                    and self.queue_size() < queue_limit
                     and self.running
                     and not self.paused
                 ):
@@ -283,9 +303,19 @@ class AsyncRolloutWorker:
                 except Exception:  # noqa: BLE001
                     logger.exception("fully-async: failed to handle aborted group")
                 return
-            self.output_queue.put((gid, result))
+            self._enqueue_ready(gid, result)
 
         return _cb
+
+    def _enqueue_ready(self, gid: int, result: list[Sample]) -> None:
+        if not self._multi_policy:
+            self.output_queue.put((gid, result))
+            return
+        # Split once at completion time so each policy's drain only ever pops
+        # its own finished rollouts (no regeneration, no re-queue into the
+        # prompt source).
+        for policy_id, sub_group in _partition_group_by_policy(result).items():
+            self._ready_by_policy.setdefault(policy_id, queue.Queue()).put((gid, sub_group))
 
 
 async def _generate_rollout_async(
@@ -295,6 +325,7 @@ async def _generate_rollout_async(
         getattr(args, "dynamic_sampling_filter_path", None) or getattr(args, "rollout_sample_filter_path", None)
     )
     max_weight_staleness = getattr(args, "max_weight_staleness", None)
+    policy_id = current_rollout_policy_id()
     worker = _get_worker(args, data_buffer)
     worker.resume()
 
@@ -326,7 +357,7 @@ async def _generate_rollout_async(
         # Pull only what this rollout still needs; the surplus stays queued for
         # the next rollout (that is the "queue stays warm" contract).
         drained = 0
-        for _gid, group in worker.get_completed_groups(limit=target - len(collected)):
+        for _gid, group in worker.get_completed_groups(limit=target - len(collected), policy_id=policy_id):
             drained += 1
             # Staleness is judged at drain time against the version the
             # trainer is about to train on (miles: get-time ``_drop_stale``).
@@ -428,6 +459,11 @@ def generate_rollout_fully_async(
         current_weight_version = current_rollout_weight_version()
     worker = _get_worker(args, data_buffer)
     if not isinstance(worker, AsyncRolloutWorker):
+        if current_rollout_policy_id() is not None:
+            raise ValueError(
+                "multi-policy drain (policy_id) is only supported with the local fully-async worker in v1, "
+                "not distributed rollout workers"
+            )
         return worker.generate(rollout_id, prefetch=worker.capacity, current_weight_version=current_weight_version)
     if current_weight_version is None:
         # Keep the legacy 3-argument call shape for custom/monkeypatched

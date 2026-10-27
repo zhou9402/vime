@@ -23,3 +23,11 @@ Each policy `model_id` binds to a serving server **of the same name** declared w
 ## Leader/follower coordination
 
 The first trainer in `--multi-policy-config` is the **leader**; its rollout index bounds the run and drives global save/eval through a `Parker` barrier (`vime/utils/multi_policy/parker.py`) that parks all followers during the critical section. Each policy saves at its own rollout id under `<save>/trainers/<trainer_id>`; global consistency is recorded in `<save>/multi_policy_state/<leader_rollout_id>.json` (`MultiPolicyCheckpointState`), and resume asserts every policy's position matches that record exactly.
+
+## Training entry (F09-4, stacked on the F05 fully-async staleness work)
+
+`train_multi_policy.py` runs one asyncio task per policy over a shared `RolloutManager`: each round is `manager.generate(rollout_id, model_id=...)` (per-policy weight version sampled from that policy's server, carried via `rollout_context`; the fully-async drain splits mixed groups by `Sample.trainer_model_id` and re-queues foreign shares) followed by `async_train` on the policy's own trainer group and a per-policy weight update targeting only that policy's engines. v1 constraints: local (non-distributed) fully-async worker, no `--colocate`, no `--use-critic`; the leader's `--num-rollout` bounds the run.
+
+## End-to-end verification (F09-5)
+
+`tests/test_multi_policy_2policy_e2e.py` (GPU-only CI) trains two policies (solver/verifier, `examples/multi_policy/generate_solver_verifier.py`) and asserts the `multi_policy_state/<N>.json` record plus both per-policy checkpoints under `<save>/trainers/<trainer_id>`; reward/grad-norm series are tracked via the F10 metric-history gate declarations.

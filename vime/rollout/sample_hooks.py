@@ -11,6 +11,7 @@ from vime.utils.types import Sample
 _current_rollout_id: int | None = None
 _task_rollout_id = ContextVar("rollout_sample_hook_id", default=None)
 _task_weight_version = ContextVar("rollout_current_weight_version", default=None)
+_task_policy_id = ContextVar("rollout_current_policy_id", default=None)
 
 
 def set_current_rollout_id(rollout_id: int | None) -> None:
@@ -23,19 +24,27 @@ def current_rollout_weight_version() -> int | None:
     return _task_weight_version.get()
 
 
+def current_rollout_policy_id() -> str | None:
+    """Policy (``Sample.trainer_model_id``) the active rollout drains for; None = single-policy."""
+    return _task_policy_id.get()
+
+
 @contextmanager
-def rollout_context(rollout_id, weight_version=None):
+def rollout_context(rollout_id, weight_version=None, policy_id=None):
     """Keep concurrent worker requests' hook contexts independent.
 
     ``weight_version`` carries the manager-sampled serving version so deeply
     wrapped/custom rollout functions (partials, decorators) see it without a
-    signature change.
+    signature change. ``policy_id`` (multi-policy runs) selects which policy's
+    groups the fully-async drain collects.
     """
     token = _task_rollout_id.set(rollout_id)
     version_token = _task_weight_version.set(weight_version)
+    policy_token = _task_policy_id.set(policy_id)
     try:
         yield
     finally:
+        _task_policy_id.reset(policy_token)
         _task_weight_version.reset(version_token)
         _task_rollout_id.reset(token)
 
