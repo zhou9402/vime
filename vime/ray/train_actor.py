@@ -13,6 +13,7 @@ from vime.observability.logging_utils import configure_logger
 from vime.ray.ray_actor import RayActor
 from vime.utils import accelerator
 from vime.utils.distributed_utils import init_gloo_group
+from vime.utils.ft_utils.heartbeat_utils import HeartbeatStatus, SimpleHeartbeat
 from vime.utils.memory_utils import clear_memory, print_memory
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,11 @@ class TrainRayActor(RayActor):
         # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
+
+        self._heartbeat = SimpleHeartbeat()
+
+    def get_heartbeat_status(self) -> HeartbeatStatus:
+        return self._heartbeat.status()
 
     def init(self, args, role, with_ref=False, with_opd_teacher=False):
         self.args = args

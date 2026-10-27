@@ -649,6 +649,24 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
         def add_fault_tolerance_arguments(parser):
             parser.add_argument(
+                "--trainer-heartbeat-checker-interval",
+                type=float,
+                default=None,
+                help=(
+                    "Interval in seconds between driver-side polls of every train actor's heartbeat. "
+                    "Unset (default) disables the checker."
+                ),
+            )
+            parser.add_argument(
+                "--trainer-heartbeat-checker-timeout",
+                type=float,
+                default=600.0,
+                help=(
+                    "Seconds without heartbeat progress (or the RPC timeout) before a train actor "
+                    "is flagged stale. Under --ci-test a stale actor raises."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-session-id",
                 type=str,
                 default=None,

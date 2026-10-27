@@ -127,3 +127,10 @@ Recreating `RolloutManager` supports the built-in data sources. Custom sources n
 If `ServingCluster` or the entire Ray cluster is lost, you must start serving again and recover from a checkpoint. Cluster preemption and node loss still require coordination between your scheduler and checkpoint recovery.
 
 See [Debugging](../developer_guide/debug.md) for more debugging options and [CI](../developer_guide/ci.md) for recovery-test coverage.
+
+## Trainer heartbeat probe
+
+Each `TrainRayActor` carries a `SimpleHeartbeat` (`vime/utils/ft_utils/heartbeat_utils.py`): a
+dependency-free counter + timestamp bumped at the train/save/update_weights/sleep/wake_up lifecycle
+boundaries. Poll it via the actor's `get_heartbeat_status()` method to detect a wedged trainer
+without disturbing the training path.

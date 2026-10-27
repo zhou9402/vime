@@ -237,6 +237,10 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
 
     ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
+    from vime.utils.ft_utils.trainer_heartbeat_checker import maybe_start_trainer_heartbeat_checker
+
+    maybe_start_trainer_heartbeat_checker(args, actor_model)
+
     return actor_model, critic_model
 
 

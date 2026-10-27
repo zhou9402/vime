@@ -175,6 +175,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def sleep(self) -> None:
+        self._heartbeat.bump()
         assert self.args.offload_train
 
         clear_memory(clear_host_memory=True)
@@ -195,6 +196,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def wake_up(self) -> None:
+        self._heartbeat.bump()
         assert self.args.offload_train
         print_memory("before wake_up model")
 
@@ -393,6 +395,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
+        self._heartbeat.bump()
         if self.args.debug_rollout_only:
             return None
 
@@ -595,6 +598,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        self._heartbeat.bump()
         if self.args.debug_rollout_only:
             return
 
@@ -622,6 +626,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def update_weights(self) -> None:
+        self._heartbeat.bump()
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 

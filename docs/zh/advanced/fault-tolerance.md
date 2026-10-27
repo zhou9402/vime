@@ -129,3 +129,9 @@ rollout 过程中，vime 定期请求 vLLM 的 `/health_generate` 接口，检�
 如果 `ServingCluster` 或整个 Ray 集群已经丢失，需要重新启动推理服务并从 checkpoint 恢复。集群抢占和节点丢失仍需要调度系统与 checkpoint 配合处理。
 
 更多调试方式见[调试指南](../developer_guide/debug.md)，恢复测试的覆盖范围见[持续集成](../developer_guide/ci.md)。
+
+## Trainer 心跳探针
+
+每个 `TrainRayActor` 带一个 `SimpleHeartbeat`（`vime/utils/ft_utils/heartbeat_utils.py`）：
+零依赖的计数器 + 时间戳，在 train/save/update_weights/sleep/wake_up 生命周期边界 bump。
+通过 actor 的 `get_heartbeat_status()` 方法轮询即可发现卡死的 trainer，不影响训练路径。
