@@ -2430,14 +2430,11 @@ def vime_validate_args(args):
             raise ValueError("P2P weight transfer mode has not been tested when PD is enabled.")
         if getattr(args, "lora_rank", 0) > 0:
             raise ValueError("LoRA weight sync is not supported for p2p (RDMA) weight transfer.")
-        if (
-            getattr(args, "dspark_enabled", False)
-            or getattr(args, "enable_mtp_training", False)
-            or getattr(args, "vllm_speculative_config", None)
-        ):
-            raise ValueError(
-                "Speculative decoding weight sync is not supported for p2p (RDMA) weight transfer."
-            )
+        from vime.backends.megatron_utils.update_weight.p2p.arguments import (
+            validate_p2p_spec_decode_args,
+        )
+
+        validate_p2p_spec_decode_args(args)
 
     # disk-backed sync (full or delta) writes on the trainer and reads on the engines: needs a shared dir
     if args.update_weight_transport == "disk" and not args.update_weight_disk_dir:

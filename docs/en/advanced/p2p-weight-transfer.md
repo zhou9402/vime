@@ -29,10 +29,21 @@ via a model replica), vime's port is replica-free:
 No trainer-side model replica, no trainer/engine version or GPU-architecture
 lockstep.
 
+## MTP draft sync
+
+With `--enable-mtp-training` and an mtp `--vllm-speculative-config`, P2P runs a
+second weight-update session per version: after the target buckets finish, the
+same buckets are re-sent inside a `start_draft_weight_update` session, and the
+vLLM worker's draft target swap routes the staged loads into the draft runner —
+so trained MTP layers reach the draft (miles v0.1.3 parity). dspark speculative
+decoding is NOT supported over p2p (its draft weights need
+`export_dspark_model_weights`, which P2P does not iterate) and is rejected at
+argument validation; use `--update-weight-transport nccl` for dspark.
+
 ## Constraints (same as miles)
 
 - Disaggregated only: rejected with `--colocate` (colocate uses CUDA IPC).
-- No LoRA, no speculative decoding over P2P in v1.
+- No LoRA over P2P. Speculative decoding: mtp only (see above); dspark rejected.
 - Mooncake is an optional dependency (`pip install vime[p2p]`, i.e.
   `mooncake-transfer-engine`); nothing imports it unless P2P is enabled.
 - Requires routable RDMA (or TCP fallback: `MOONCAKE_PROTOCOL=tcp`) between

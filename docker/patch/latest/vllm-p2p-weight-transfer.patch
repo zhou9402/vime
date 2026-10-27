@@ -30,10 +30,10 @@ index c0e88e03bf..e3ab6df766 100644
      "vllm.distributed.weight_transfer.modelexpress_engine",
 diff --git a/vllm/distributed/weight_transfer/p2p_engine.py b/vllm/distributed/weight_transfer/p2p_engine.py
 new file mode 100644
-index 0000000000..994dced25f
+index 0000000000..7756c5d6cc
 --- /dev/null
 +++ b/vllm/distributed/weight_transfer/p2p_engine.py
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,248 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""P2P (Mooncake RDMA) weight transfer engine — replica-free design.
@@ -113,8 +113,9 @@ index 0000000000..994dced25f
 +
 +    init_info_cls = P2PWeightTransferInitInfo
 +    update_info_cls = P2PWeightTransferUpdateInfo
-+    # The trainer rejects speculative decoding for p2p; refuse draft sessions too.
-+    supports_draft_weight_update = False
++    # Draft sessions retarget `self.model` worker-side (set_weight_update_target);
++    # staged loads then land in the draft runner unchanged.
++    supports_draft_weight_update = True
 +
 +    def __init__(
 +        self,
@@ -282,7 +283,7 @@ index 0000000000..994dced25f
 +        sock.bind(("", 0))
 +        return sock.getsockname()[1]
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 1514fdf982..4e425c6eb7 100644
+index afae96c8db..f0ec0fa026 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -1533,6 +1533,29 @@ class Worker(WorkerBase):

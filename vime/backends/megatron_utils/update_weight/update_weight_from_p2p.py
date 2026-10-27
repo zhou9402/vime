@@ -224,28 +224,22 @@ class UpdateWeightFromP2P:
         )
 
         if self._driver_rank() == 0:
-            healthy = [e for e, t in zip(self.rollout_engines, self._targets) if not t.is_errored]
-            for engine in healthy:
+            for engine in self._healthy_engines():
                 _engine_call(engine, "pause_generation", mode="abort" if flush_cache else "in_place")
             if flush_cache:
-                for engine in healthy:
+                for engine in self._healthy_engines():
                     _engine_call(engine, "flush_cache")
-            for engine in healthy:
-                _engine_call(engine, "start_weight_update")
         _gloo_barrier()
 
-        for bucket in self._iterator.get_hf_weight_chunks(self._weights_getter()):
-            self._send_bucket(dict(bucket))
-        if self._buffers is not None:
-            self._buffers.wait_for_all_writes()
-        _quarantine_errored_engines(self._targets, self.weight_version)
-        _gloo_barrier()
+        # Target session, then (mtp only) a draft session over the same buckets —
+        # mirrors update_weight_from_distributed.py:113-123 (for mtp the source
+        # stays the target weights; the engine swaps target at start_draft).
+        self._run_session("start_weight_update")
+        if self._mtp_draft_enabled():
+            self._run_session("start_draft_weight_update")
 
         if self._driver_rank() == 0:
-            for engine, target in zip(self.rollout_engines, self._targets):
-                if target.is_errored:
-                    continue
-                _engine_call(engine, "finish_weight_update", weight_version=str(self.weight_version))
+            for engine in self._healthy_engines():
                 _engine_call(engine, "continue_generation")
         _gloo_barrier()
 
@@ -266,6 +260,55 @@ class UpdateWeightFromP2P:
                 "they were not resumed (weights may be partially written). "
                 f"First error: {errored[0].errored!r}"
             )
+
+    def _mtp_draft_enabled(self) -> bool:
+        """Same trigger as the distributed path's draft pass (mtp only; dspark is
+        rejected at argument validation)."""
+        return bool(
+            self.args.enable_mtp_training
+            and (self.args.vllm_speculative_config or {}).get("method") == "mtp"
+        )
+
+    def _healthy_engines(self) -> list:
+        return [e for e, t in zip(self.rollout_engines, self._targets) if not t.is_errored]
+
+    def _run_session(self, start_method: str) -> None:
+        """One weight-update session: start -> all buckets -> finish(version).
+
+        Called once per version (target only) or twice (target, then draft, when
+        mtp speculative decoding is active); the version does not change between
+        the two sessions.
+
+        start_method is "start_weight_update" for the target model or
+        "start_draft_weight_update" for the draft (the worker swaps its update
+        target and finish_weight_update resets it). weight_version is unchanged
+        across the two sessions. A control-plane failure here (e.g. a stale
+        engine without draft support) is not transient: the engine is quarantined.
+        """
+        if self._driver_rank() == 0:
+            for engine, target in zip(self.rollout_engines, self._targets):
+                if target.is_errored:
+                    continue
+                try:
+                    _engine_call(engine, start_method)
+                except Exception as error:
+                    target.mark_errored(error, self.weight_version)
+        _quarantine_errored_engines(self._targets, self.weight_version)
+        _gloo_barrier()
+
+        for bucket in self._iterator.get_hf_weight_chunks(self._weights_getter()):
+            self._send_bucket(dict(bucket))
+        if self._buffers is not None:
+            self._buffers.wait_for_all_writes()
+        _quarantine_errored_engines(self._targets, self.weight_version)
+        _gloo_barrier()
+
+        if self._driver_rank() == 0:
+            for engine, target in zip(self.rollout_engines, self._targets):
+                if target.is_errored:
+                    continue
+                _engine_call(engine, "finish_weight_update", weight_version=str(self.weight_version))
+        _gloo_barrier()
 
     def _send_bucket(self, bucket: dict[str, torch.Tensor]) -> None:
         if self._buffers is None:

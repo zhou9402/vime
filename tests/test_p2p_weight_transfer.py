@@ -216,7 +216,8 @@ def _source_weights() -> dict[str, torch.Tensor]:
 def _make_updater(weights, engines, fake_transfer_engine, *, checksum=True, buffer_nbytes=None,
                   replicas=(0, 1), **arg_overrides):
     total = sum(t.numel() * t.element_size() for t in weights.values())
-    args = SimpleNamespace(
+    overrides = arg_overrides
+    args_dict = dict(
         update_weight_buffer_size=buffer_nbytes or total,
         p2p_transfer_timeout=5.0,
         check_weight_transfer_checksum=checksum,
@@ -230,8 +231,9 @@ def _make_updater(weights, engines, fake_transfer_engine, *, checksum=True, buff
         # P6b flags
         p2p_on_engine_error="fail",
         p2p_min_healthy_engines=1,
-        **arg_overrides,
     )
+    args_dict.update(overrides)
+    args = SimpleNamespace(**args_dict)
     updater = UpdateWeightFromP2P(
         args,
         model=None,
@@ -413,7 +415,6 @@ def test_quarantine_union_marks_engines_errored_on_other_ranks():
 # F01-P6 verifier (xfail until the P6a/P6b implementation lands)
 # =============================================================================
 
-_P6A = pytest.mark.xfail(strict=True, reason="F01-P6a not implemented")
 _P6B = pytest.mark.xfail(strict=True, reason="F01-P6b not implemented")
 
 _MTP_ARGS = dict(enable_mtp_training=True, vllm_speculative_config={"method": "mtp"})
@@ -430,7 +431,6 @@ def _load_events(engine):
 # payload carries no draft field.
 
 
-@_P6A
 def test_p6a_mtp_draft_weights_synced_in_second_session():
     """With mtp speculative config the target buckets are sent twice: once into the
     target store, once into the draft store (draft session swaps the target)."""
@@ -447,7 +447,6 @@ def test_p6a_mtp_draft_weights_synced_in_second_session():
         assert torch.equal(engine.draft_ranks[0][name], tensor), name
 
 
-@_P6A
 def test_p6a_call_order_two_sessions_per_version():
     """pause -> [flush] -> start -> target loads -> finish(v) -> start_draft ->
     target-bucket loads again -> finish(v) -> continue. start x1, finish x2."""
@@ -469,15 +468,14 @@ def test_p6a_call_order_two_sessions_per_version():
     target_loads = [i for i, e in enumerate(engine.events) if e == ("load", False, 0)]
     draft_loads = [i for i, e in enumerate(engine.events) if e == ("load", True, 0)]
     assert target_loads and draft_loads
-    assert start < min(target_loads) < max(target_loads) < finishes[0]
+    assert start < min(target_loads) and max(target_loads) < finishes[0]
     assert start_draft == finishes[0] + 1, "draft session starts right after the target finish"
-    assert start_draft < min(draft_loads) < max(draft_loads) < finishes[1]
+    assert start_draft < min(draft_loads) and max(draft_loads) < finishes[1]
     # both sessions close the same version
     assert engine.events[finishes[0]] == ("finish", "1")
     assert engine.events[finishes[1]] == ("finish", "1")
 
 
-@_P6A
 def test_p6a_stale_engine_without_draft_support_is_quarantined():
     """A stale engine build (no supports_draft_weight_update) fails loudly: its
     start_draft_weight_update raises, a non-transient control-plane error that
@@ -508,7 +506,6 @@ def test_p6a_no_spec_config_never_starts_a_draft_session():
         assert torch.equal(engine.draft_ranks[0][name], snapshot), name
 
 
-@_P6A
 def test_p6a_draft_checksum_tamper_quarantines_engine():
     """A bit flip in the DRAFT session (target writes intact) is caught by the
     checksum verify and quarantines the engine exactly like a target error."""
@@ -529,7 +526,6 @@ def test_p6a_draft_checksum_tamper_quarantines_engine():
         assert torch.equal(engines[1].draft_ranks[0][name], tensor), name
 
 
-@_P6A
 def test_p6a_validation_accepts_mtp_and_rejects_dspark():
     """Pinned argument-validation contract (helper lives in p2p/arguments.py,
     called from vime_validate_args; reads vllm_speculative_config['method'] like

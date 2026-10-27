@@ -22,10 +22,19 @@ Kimi-K2 1T:53.3 s → 7.2 s 每次更新)。
 
 无需训练侧 model replica,也不要求训练/引擎的版本或 GPU 架构一致。
 
+## MTP 草稿权重同步
+
+使用 `--enable-mtp-training` 且 `--vllm-speculative-config` 为 mtp 时,P2P 每个版本跑两个
+更新会话:目标权重桶完成后,同一批桶在 `start_draft_weight_update` 会话中再发一次,
+vLLM worker 的 draft target 切换会把暂存加载路由到草稿 runner——训练后的 MTP 层由此到达草稿
+(对齐 miles v0.1.3)。dspark 投机解码不支持 p2p(其草稿权重需要
+`export_dspark_model_weights`,P2P 不迭代该路径),参数校验会直接拒绝;dspark 请用
+`--update-weight-transport nccl`。
+
 ## 限制(与 miles 一致)
 
 - 仅分离部署:与 `--colocate` 互斥(colocate 走 CUDA IPC)。
-- v1 不支持 LoRA,不支持投机解码。
+- 不支持 LoRA。投机解码仅支持 mtp(见上);dspark 会被拒绝。
 - Mooncake 为可选依赖(`pip install vime[p2p]`,即 `mooncake-transfer-engine`);
   不启用 P2P 时不会 import。
 - 训练与引擎主机之间需要可路由的 RDMA(或 TCP 回退:`MOONCAKE_PROTOCOL=tcp`);
