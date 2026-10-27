@@ -13,5 +13,6 @@ Rollout 与调度
    ../advanced/external-rollout-engines.md
    ../advanced/delta-weight-sync.md
    ../advanced/weight-sync-verification.md
+   ../advanced/p2p-weight-transfer.md
    ../advanced/vllm-config.md
    ../advanced/speculative-decoding.md
