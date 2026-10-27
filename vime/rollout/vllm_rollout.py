@@ -681,7 +681,11 @@ async def generate_and_rm(
     attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
 )
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    sample_done_callback=None,
 ) -> list[Sample] | list[list[Sample]]:
     # ``generate_and_rm`` may return either a ``Sample`` or a ``list[Sample]``
     # depending on whether the ``--custom-generate-function-path`` callable
@@ -706,9 +710,17 @@ async def generate_and_rm_group(
         if getattr(args, "vllm_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+
+        async def _run_one(sample=sample, params=current_sampling_params):
+            try:
+                return await generate_and_rm(args, sample, params, evaluation=evaluation)
+            finally:
+                # Fully-async sample-level backfill accounting; fires on
+                # success, failure and cancellation alike.
+                if sample_done_callback is not None:
+                    sample_done_callback()
+
+        tasks.append(asyncio.create_task(_run_one()))
 
     group = await asyncio.gather(*tasks)
 

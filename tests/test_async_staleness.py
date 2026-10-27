@@ -27,13 +27,12 @@ except ImportError:
     sys.modules["transformers"] = _tf_stub
 
 import pytest
+from test_async_staleness_simulation import STALE_SCHEDULE, SimGroup, run_simulation
 
 import vime.rollout.fully_async_rollout as fa
 from vime.data.transport import RolloutGroupRef
 from vime.utils.staleness import group_is_stale, group_staleness, sample_staleness
 from vime.utils.types import Sample
-
-from test_async_staleness_simulation import STALE_SCHEDULE, SimGroup, SimSample, run_simulation
 
 NUM_GPUS = 0
 

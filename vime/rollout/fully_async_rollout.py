@@ -35,10 +35,11 @@ import threading
 import time
 
 from vime.data.transport import discard_rollout_group, publish_rollout_async
+from vime.rollout.async_policy import UnusedReason, async_capacity_limit, handle_unused_group
 from vime.rollout.base_types import RolloutFnTrainOutput, finalize_rollout_groups
 from vime.rollout.filter_hub.base_types import call_dynamic_filter
-from vime.rollout.async_policy import UnusedReason, async_capacity_limit, handle_unused_group
 from vime.rollout.sample_hooks import current_rollout_weight_version
+from vime.rollout.submission_scheduler import make_submission_scheduler
 from vime.rollout.vllm_rollout import GenerateState, generate_and_rm_group
 from vime.utils.async_utils import run
 from vime.utils.http_utils import get_rollout_num_engines
@@ -109,6 +110,9 @@ class AsyncRolloutWorker:
         self.poll_interval = 0.01
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
+        # Group-level slots by default (vime's historical behavior);
+        # --rollout-submission-granularity=sample opts into backfill.
+        self.submission = make_submission_scheduler(args, default="group")
 
     # -- public --------------------------------------------------------------
 
@@ -208,7 +212,7 @@ class AsyncRolloutWorker:
                 # --async-capacity-factor the gate widens/narrows to the cap.
                 queue_limit = self.capacity_limit or max_concurrent
                 while (
-                    len(active_tasks) < max_concurrent
+                    self.submission.has_capacity(pending_groups=len(active_tasks), group_budget=max_concurrent)
                     and self.output_queue.qsize() < queue_limit
                     and self.running
                     and not self.paused
@@ -225,10 +229,12 @@ class AsyncRolloutWorker:
                                 group,
                                 sampling_params=self.state.sampling_params.copy(),
                                 evaluation=False,
+                                sample_done_callback=self.submission.sample_done_callback,
                             )
                         )
                         task.add_done_callback(self._make_done_cb(gid))
                         active_tasks.add(task)
+                        self.submission.on_submit(groups)
 
                 with self.condition:
                     self.active = len(active_tasks)

@@ -686,6 +686,20 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "buffer; vime caps queue look-ahead instead)."
                 ),
             )
+            parser.add_argument(
+                "--rollout-submission-granularity",
+                type=str,
+                default=None,
+                choices=["group", "sample"],
+                help=(
+                    "Fully-async rollout only: granularity at which a completed unit frees submission "
+                    "capacity. sample frees a slot per finished sample, so a replacement group is "
+                    "admitted once n_samples_per_prompt samples complete (sample-level backfill); "
+                    "group waits for a whole group. Default: group, preserving vime's historical "
+                    "pacing (note: miles defaults to sample under --fully-async; opt in explicitly "
+                    "with =sample). Mirrors miles --rollout-submission-granularity."
+                ),
+            )
             return parser
 
         def add_fault_tolerance_arguments(parser):

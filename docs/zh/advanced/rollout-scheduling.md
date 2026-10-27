@@ -81,6 +81,8 @@ $$K=\left\lfloor\frac{CE}{G}\right\rfloor$$
 
 `--async-capacity-factor F`（默认关闭）把生成侧的领先量限制在 $\lfloor F \cdot B \rfloor$ 个「已完成 + 在途」组，其中 $B$ 为 `rollout_batch_size`。启动时校验该上限不得小于 $\max(B, \text{并发度})$，以免 warmup 饥饿。它对应 miles 的 `--async-data-buffer-capacity-factor`；vime 限制的是队列领先量而非内存 buffer。
 
+`--rollout-submission-granularity {group,sample}` 决定提交容量何时释放：`group`（默认，vime 既有节奏）等整组返回才释放槽位；`sample` 每完成一个样本释放一个槽位，凑满 `n_samples_per_prompt` 个样本即可补交新组，而不必等组内最慢的样本。（miles 在 `--fully-async` 下默认 `sample`；vime 保持 `group`，backfill 需显式开启。）组仍整体提交、绝不拆分。样本级 backfill 目前只作用于本地（object-store）worker；分布式生成 actor 仍按组粒度调度，留待后续 B5d。
+
 若 producer 每秒稳定产出 $\lambda$ 个被接受的组，训练每秒消费 $\mu$ 个，吞吐上限为 $\min(\lambda,\mu)$。当 $\lambda>\mu$，无限队列约以 $\lambda-\mu$ 的速度增长，需要 backpressure。稳定队列按 Little 定律有 $L=\lambda W_q$，其中 $L$ 是平均排队组数、$W_q$ 是平均队内时间。只有其他环节吃得下，增加 producer 才有用。
 
 同时观察 `staleness/mean`、`staleness/max`、有效组吞吐、reward、mask/clip 比例及训推 log-prob 差异。Off-policy 修正不保证任意延迟都无害。[系统耗时推导](rl-systems.md#async)与 [PipelineRL 论文](https://arxiv.org/abs/2509.19128)可作为流水线背景，实际行为以上述 vime 实现为准。

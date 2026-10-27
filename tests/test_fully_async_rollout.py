@@ -231,7 +231,7 @@ def test_loop_backpressure_stops_topping_up_when_queue_is_full(monkeypatch):
     fuel = 60
     data_buffer = _FakeDataBuffer([_make_group(i) for i in range(fuel)])
 
-    async def _instant_generate(args, group, sampling_params, evaluation):
+    async def _instant_generate(args, group, sampling_params, evaluation, sample_done_callback=None):
         return group
 
     monkeypatch.setattr(fa, "generate_and_rm_group", _instant_generate)
@@ -263,7 +263,7 @@ def test_local_worker_lifecycle_is_scoped_to_source(monkeypatch, transport):
     monkeypatch.setattr(fa, "GenerateState", _FakeGenerateState)
     monkeypatch.setattr(fa, "get_rollout_num_engines", lambda args: 1)
 
-    async def generate(args, group, sampling_params, evaluation):
+    async def generate(args, group, sampling_params, evaluation, sample_done_callback=None):
         await asyncio.sleep(0.01)
         return group
 

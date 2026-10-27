@@ -18,7 +18,7 @@ When the flag is unset the default is reason-dependent: ABORTED groups retry
 from __future__ import annotations
 
 import logging
-from enum import Enum
+from enum import StrEnum
 
 from vime.data.transport import discard_rollout_group
 from vime.rollout.base_types import iter_samples
@@ -27,7 +27,7 @@ from vime.utils.types import Sample
 logger = logging.getLogger("vime.rollout.unused_samples")
 
 
-class UnusedReason(str, Enum):
+class UnusedReason(StrEnum):
     ABORTED = "aborted"
     STALE = "stale"
 

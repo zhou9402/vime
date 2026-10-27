@@ -290,7 +290,7 @@ def test_capacity_gate_bounds_queue_growth(monkeypatch):
     fuel = 60
     buffer = _FakeBuffer([[_sample(i)] for i in range(fuel)])
 
-    async def _instant_generate(args, group, sampling_params, evaluation):
+    async def _instant_generate(args, group, sampling_params, evaluation, sample_done_callback=None):
         return group
 
     monkeypatch.setattr(fa, "generate_and_rm_group", _instant_generate)
