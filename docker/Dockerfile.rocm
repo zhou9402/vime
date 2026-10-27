@@ -90,6 +90,11 @@ RUN pip install "git+https://github.com/fzyzcjy/torch_memory_saver.git@${TMS_COM
 COPY requirements.txt /tmp/vime-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/vime-requirements.txt
 
+# mbridge for --hf-to-megatron-load-mode mbridge (day-0 model bridges), pinned to
+# the same commit miles uses; --no-deps so it cannot disturb the pinned stack.
+ARG MBRIDGE_COMMIT=89eb10887887bc74853f89a4de258c0702932a1c
+RUN pip install --no-cache-dir --no-deps "git+https://github.com/ISEEKYAN/mbridge.git@${MBRIDGE_COMMIT}"
+
 # Megatron asserts numpy 1.x; pin numpy/scipy/pyarrow back. pyarrow 25.0.1 is the newest
 # that imports under numpy 1.26.4 (base's 26.0.0 is numpy-2-only) and still satisfies datasets>=24.
 RUN pip install --no-cache-dir "numpy==1.26.4" "scipy==1.17.1" "pyarrow==25.0.1"

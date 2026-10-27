@@ -197,6 +197,11 @@ RUN if [ "${ENABLE_CUDA_13}" != "1" ]; then \
 
 RUN pip install "scipy==1.17.1" "kernels<0.15.0"
 
+# mbridge for --hf-to-megatron-load-mode mbridge (day-0 model bridges), pinned to
+# the same commit miles uses; --no-deps so it cannot disturb the pinned stack.
+ARG MBRIDGE_COMMIT=89eb10887887bc74853f89a4de258c0702932a1c
+RUN pip install --no-deps "git+https://github.com/ISEEKYAN/mbridge.git@${MBRIDGE_COMMIT}"
+
 RUN rm -rf /root/.cache/pip /root/flash-attention
 
 # ====================================== Patches ============================================

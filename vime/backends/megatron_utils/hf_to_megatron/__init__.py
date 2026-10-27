@@ -32,12 +32,21 @@ _LOADERS = {
 }
 
 
-def supports_hf_weight_loading(path: str | Path) -> bool:
+def supports_hf_weight_loading(path: str | Path, load_mode: str = "builtin") -> bool:
+    if load_mode == "mbridge":
+        from .mbridge_load import supports_mbridge_loading
+
+        return supports_mbridge_loading(path)
     config = AutoConfig.from_pretrained(path, trust_remote_code=True)
     return config.model_type in _LOADERS
 
 
 def load_hf_weights(args, model, path: str | Path) -> None:
+    if getattr(args, "hf_to_megatron_load_mode", "builtin") == "mbridge":
+        from .mbridge_load import load_hf_weights_with_mbridge
+
+        load_hf_weights_with_mbridge(args, model, path)
+        return
     config = AutoConfig.from_pretrained(path, trust_remote_code=True)
     try:
         get_hf_tensor = _LOADERS[config.model_type]

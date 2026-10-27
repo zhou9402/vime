@@ -1773,6 +1773,24 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_model_load_arguments(parser):
+            parser.add_argument(
+                "--hf-to-megatron-load-mode",
+                type=str,
+                choices=["builtin", "mbridge"],
+                default="builtin",
+                help=(
+                    "How to load HuggingFace weights into the Megatron model. "
+                    "'builtin' (default) uses vime's hand-written converters in "
+                    "backends/megatron_utils/hf_to_megatron. 'mbridge' uses the external "
+                    "mbridge package with vime_plugins/mbridge bridges (day-0 models: "
+                    "DeepSeek-V4/V4.1, GLM5-Next, Kimi-K3, Qwen3.8-Next). "
+                    "Corresponds to miles' --megatron-to-hf-mode: miles 'raw' == "
+                    "mbridge-based load, miles 'bridge' (NVIDIA Megatron-Bridge) is not supported."
+                ),
+            )
+            return parser
+
         # Add custom arguments in front to prevent overwritten some vime arguments.
         if add_custom_arguments is not None:
             parser = add_custom_arguments(parser)
@@ -1795,6 +1813,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_dspark_training_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_model_load_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -2077,7 +2096,12 @@ def vime_validate_args(args):
     if load_is_hf:
         from vime.backends.megatron_utils.hf_to_megatron import supports_hf_weight_loading
 
-        load_is_hf = supports_hf_weight_loading(args.load)
+        if args.hf_to_megatron_load_mode == "mbridge" and importlib.util.find_spec("mbridge") is None:
+            raise ModuleNotFoundError(
+                "--hf-to-megatron-load-mode mbridge requires the mbridge package (pinned commit).",
+                name="mbridge",
+            )
+        load_is_hf = supports_hf_weight_loading(args.load, args.hf_to_megatron_load_mode)
     if not load_is_megatron:
         args.no_load_optim = True
         args.no_load_rng = True

@@ -14,3 +14,4 @@ Understand policy objectives, precision, parallelism, and memory.
    ../advanced/megatron-config.md
    ../advanced/arch-support-beyond-megatron.md
    ../advanced/model-converter-harness.md
+   ../advanced/mbridge-load-mode.md

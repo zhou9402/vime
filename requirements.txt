@@ -26,3 +26,7 @@ vllm-router>=0.1.15
 wandb
 xxhash  # disk delta weight sync (checksum + codec)
 zstandard
+
+# mbridge (day-0 model bridges, --hf-to-megatron-load-mode mbridge) is NOT a PyPI
+# dependency here; the Dockerfiles install it with --no-deps pinned to
+# ISEEKYAN/mbridge@89eb10887887bc74853f89a4de258c0702932a1c (same SHA as miles).

@@ -160,6 +160,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi; \
     python3 -m pip install -c "${ROCM_CONSTRAINTS}" -r requirements.txt
 
+# mbridge for --hf-to-megatron-load-mode mbridge (day-0 model bridges), pinned to
+# the same commit miles uses; --no-deps so it cannot disturb the pinned stack.
+ARG MBRIDGE_COMMIT=89eb10887887bc74853f89a4de258c0702932a1c
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-deps "git+https://github.com/ISEEKYAN/mbridge.git@${MBRIDGE_COMMIT}"
+
 # Megatron requires NumPy 1.x: this base ships 2.3.5 and Megatron-LM asserts numpy < 2 at import,
 # killing the trainer actor after the vLLM engine is already up.
 RUN --mount=type=cache,target=/root/.cache/pip \
