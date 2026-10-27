@@ -431,10 +431,101 @@ def test_minimax_and_mimo_keep_their_small_qwen_deltas():
 
 
 @pytest.mark.unit
+def test_dsv4_mapping_round_trip_bitwise():
+    """Every DSv4 mapping branch round-trips bitwise (exporter -> loader)."""
+    from vime.backends.megatron_utils.hf_to_megatron.deepseek_v4 import deepseek_v4_hf_tensor
+    from vime.backends.megatron_utils.megatron_to_hf import _convert_to_hf_core
+    from vime.backends.megatron_utils.megatron_to_hf.deepseekv4 import _PENDING_ALPHAS
+
+    layer_names = [
+        "self_attention.linear_q_down_proj.weight",
+        "self_attention.q_layernorm.weight",
+        "self_attention.linear_q_up_proj.weight",
+        "self_attention.linear_kv_proj.weight",
+        "self_attention.kv_layernorm.weight",
+        "self_attention.linear_o_group_proj",
+        "self_attention.linear_proj.weight",
+        "self_attention.core_attention.attn_sink",
+        "self_attention.core_attention.compressor.ape",
+        "self_attention.core_attention.compressor.linear_wkv.weight",
+        "self_attention.core_attention.compressor.linear_wgate.weight",
+        "self_attention.core_attention.compressor.norm.weight",
+        "self_attention.core_attention.indexer.linear_wq_b.weight",
+        "self_attention.core_attention.indexer.linear_wk.weight",
+        "self_attention.core_attention.indexer.k_norm.weight",
+        "self_attention.core_attention.indexer.k_norm.bias",
+        "self_attention.core_attention.indexer.linear_weights_proj.weight",
+        "self_attention.core_attention.indexer.compressor.ape",
+        "self_attention.core_attention.indexer.compressor.linear_wkv.weight",
+        "self_attention.core_attention.indexer.compressor.linear_wgate.weight",
+        "self_attention.core_attention.indexer.compressor.norm.weight",
+        "input_layernorm.weight",
+        "pre_mlp_layernorm.weight",
+        "mlp.router.weight",
+        "mlp.router.expert_bias",
+        "mlp.router.tid2eid",
+        "self_attention_hyper_connection.mapping_proj.weight",
+        "self_attention_hyper_connection.bias",
+        "self_attention_hyper_connection.alpha_pre",
+        "self_attention_hyper_connection.alpha_post",
+        "self_attention_hyper_connection.alpha_res",
+        "mlp_hyper_connection.mapping_proj.weight",
+        "mlp_hyper_connection.bias",
+        "mlp_hyper_connection.alpha_pre",
+        "mlp_hyper_connection.alpha_post",
+        "mlp_hyper_connection.alpha_res",
+        "mlp.experts.linear_fc1.weight3",
+        "mlp.experts.linear_fc2.weight3",
+        "mlp.shared_experts.linear_fc1.weight",
+        "mlp.shared_experts.linear_fc2.weight",
+        "mlp.linear_fc1.weight",
+        "mlp.linear_fc2.weight",
+    ]
+    names = [
+        "module.module.embedding.word_embeddings.weight",
+        "module.module.output_layer.weight",
+        "module.module.decoder.final_layernorm.weight",
+        "module.module.decoder.hc_head_fn",
+        "module.module.decoder.hc_head_base",
+        "module.module.decoder.hc_head_scale",
+    ] + [f"module.module.decoder.layers.1.{rest}" for rest in layer_names]
+
+    torch.manual_seed(0)
+    params = {}
+    for name in names:
+        if name.endswith(".bias") or "norm.weight" in name or "expert_bias" in name or "tid2eid" in name:
+            shape = (8,)
+        elif "alpha_" in name:
+            shape = (1,)
+        elif "attn_sink" in name or name.endswith("ape"):
+            shape = (4,)
+        elif "hc_head" in name or name.endswith(("fn", "base")) and "hyper_connection" in name:
+            shape = (8, 8)
+        else:
+            shape = (16, 8)
+        params[name] = torch.randn(shape)
+
+    hf_tensors = {}
+    for name, param in params.items():
+        for hf_name, tensor in _convert_to_hf_core(_EXPORT_ARGS, "deepseekv4config", name, param):
+            assert hf_name not in hf_tensors, f"duplicate HF tensor {hf_name}"
+            hf_tensors[hf_name] = tensor
+    assert not _PENDING_ALPHAS, "exporter must flush every packed alpha once the site is complete"
+
+    config = types.SimpleNamespace(model_type="deepseek_v4", tie_word_embeddings=False)
+    reader = DictReader(hf_tensors)
+    for name, param in params.items():
+        loaded = deepseek_v4_hf_tensor(name, reader, config)
+        assert loaded.shape == param.shape, f"{name}: {tuple(loaded.shape)} != {tuple(param.shape)}"
+        assert torch.equal(loaded, param), f"{name}: not bitwise"
+
+
+@pytest.mark.unit
 def test_loader_scope_stays_explicit():
     assert set(_LOADERS) == {
         "deepseek_v3",
         "deepseek_v32",
+        "deepseek_v4",
         "glm4",
         "glm4_moe",
         "glm4_moe_lite",

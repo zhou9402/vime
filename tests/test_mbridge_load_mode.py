@@ -104,29 +104,7 @@ def test_supports_dispatch_by_mode(monkeypatch, tmp_path):
 
 def test_mbridge_registry_error_mentions_model_type(monkeypatch, tmp_path):
     """An unsupported checkpoint in mbridge mode must fail loudly, not fall back."""
-    fake_registry = {"kimi_k3": object()}
-
-    class FakeAutoBridge:
-        @staticmethod
-        def from_pretrained(path, trust_remote_code=True):
-            raise KeyError("fake_model_type")
-
-    fake_mbridge = types.ModuleType("mbridge")
-    fake_mbridge.AutoBridge = FakeAutoBridge
-    fake_mbridge.__path__ = []
-    fake_core_bridge = types.ModuleType("mbridge.core.bridge")
-    fake_core_bridge._MODEL_REGISTRY = fake_registry
-    # vime_plugins.mbridge.patch imports mbridge.models.ext.deepseek_v3 at import time.
-    fake_dequant = types.ModuleType("mbridge.models.ext.deepseek_v3")
-    fake_dequant.dequant_fp8_safetensor_io = types.SimpleNamespace(safe_open=None)
-    for name in ("mbridge.core", "mbridge.models", "mbridge.models.ext"):
-        module = types.ModuleType(name)
-        module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setitem(sys.modules, "mbridge", fake_mbridge)
-    monkeypatch.setitem(sys.modules, "mbridge.core.bridge", fake_core_bridge)
-    monkeypatch.setitem(sys.modules, "mbridge.models.ext.deepseek_v3", fake_dequant)
-    monkeypatch.delitem(sys.modules, "vime_plugins.mbridge", raising=False)
+    monkeypatch.setattr(mbridge_load, "_registered_model_types", lambda: {"kimi_k3"})
     monkeypatch.setattr(mbridge_load, "mbridge_available", lambda: True)
     monkeypatch.setattr(
         hf_to_megatron.AutoConfig, "from_pretrained", lambda *a, **k: types.SimpleNamespace(model_type="fake_model_type")
@@ -148,3 +126,13 @@ def test_registry_helper_names_pin_on_drift(monkeypatch):
     monkeypatch.setitem(sys.modules, "mbridge.core.bridge", fake_bridge)
     with pytest.raises(RuntimeError, match=mbridge_load.MBRIDGE_PIN):
         mbridge_load._model_registry()
+
+
+def test_dsv4_bridge_registers_with_mbridge():
+    """Smoke: importing vime_plugins.mbridge registers DeepseekV4Bridge (GPU/dev images only)."""
+    pytest.importorskip("mbridge")
+    pytest.importorskip("megatron.core")
+    import vime_plugins.mbridge  # noqa: F401
+    from mbridge.core.bridge import _MODEL_REGISTRY
+
+    assert "deepseek_v4" in _MODEL_REGISTRY
