@@ -8,3 +8,4 @@ Test changes and configure development dependencies.
 
    ../developer_guide/ci.md
    ../developer_guide/install_flashqla.md
+   ../advanced/triton-kernels.md

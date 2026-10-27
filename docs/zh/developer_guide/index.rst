@@ -8,3 +8,4 @@
 
    ../developer_guide/ci.md
    ../developer_guide/install_flashqla.md
+   ../advanced/triton-kernels.md
