@@ -13,4 +13,5 @@ Place engines, schedule generation, and move data and weights.
    ../advanced/external-rollout-engines.md
    ../advanced/delta-weight-sync.md
    ../advanced/vllm-config.md
+   ../advanced/async-eval.md
    ../advanced/speculative-decoding.md

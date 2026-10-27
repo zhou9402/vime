@@ -192,6 +192,9 @@ class RayTrainGroup:
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
 
+    def export_hf(self, rollout_id: int, hf_dir: str) -> None:
+        """Fan out an HF snapshot export to every rank (used by the eval dispatcher)."""
+        ray.get([actor.export_hf.remote(rollout_id, hf_dir) for actor in self._actor_handlers])
     def offload(self):
         return ray.get([actor.sleep.remote() for actor in self._actor_handlers])
 

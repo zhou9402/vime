@@ -4,6 +4,7 @@ import ray
 
 from vime.data.checkpoint import save_checkpoint
 from vime.observability.logging_utils import configure_logger, finish_tracking, init_tracking
+from vime.ray.eval_dispatch import create_eval_dispatcher
 from vime.ray.placement_group import create_rollout_manager, create_training_models
 from vime.utils.arguments import parse_args
 from vime.utils.cleanup import Cleanup
@@ -14,6 +15,10 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
     release_train = args.release_train
 
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+
+    # Non-blocking eval dispatch on a daemon thread; with snapshots disabled it
+    # degrades to the same blocking eval call as before.
+    eval_dispatcher = create_eval_dispatcher(args, actor_model, rollout_manager)
 
     if args.offload_rollout and not release_train:
         ray.get(rollout_manager.onload_weights.remote())
@@ -32,7 +37,8 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
-        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        eval_dispatcher.dispatch(rollout_id=0, force=True)
+        eval_dispatcher.drain()
 
     def offload_train(actor_trains_this_step):
         # Each model auto-offloads after train() when offload_train is set,
@@ -43,61 +49,66 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
             else:
                 critic_model.clear_memory()
 
-    # train loop.
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+    # train loop; the dispatcher settles in-flight evals even on failure.
+    try:
+        for rollout_id in range(args.start_rollout_id, args.num_rollout):
+            if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+                eval_dispatcher.dispatch(rollout_id, force=True)
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+            rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
-        if args.offload_rollout:
-            ray.get(rollout_manager.offload.remote())
+            if args.offload_rollout:
+                ray.get(rollout_manager.offload.remote())
 
-        if release_train:
-            actor_model.create()
+            if release_train:
+                actor_model.create()
 
-        actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
-            if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+            actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+            if args.use_critic:
+                value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
+                if actor_trains:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+                else:
+                    ray.get(value_refs)
             else:
-                ray.get(value_refs)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
-        # Runtime completion releases queue capacity, without claiming that the
-        # model/optimizer or this data progress have a durable joint checkpoint.
-        ray.get(rollout_manager.training_completed.remote(rollout_id))
+            # Runtime completion releases queue capacity, without claiming that the
+            # model/optimizer or this data progress have a durable joint checkpoint.
+            ray.get(rollout_manager.training_completed.remote(rollout_id))
 
-        if release_train or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
-            save_checkpoint(
-                args,
-                rollout_id,
-                actor_model,
-                critic_model,
-                rollout_manager,
-                actor_trains=actor_trains,
-                restore_plan=restore_plan,
-            )
+            if release_train or should_run_periodic_action(
+                rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+            ):
+                save_checkpoint(
+                    args,
+                    rollout_id,
+                    actor_model,
+                    critic_model,
+                    rollout_manager,
+                    actor_trains=actor_trains,
+                    restore_plan=restore_plan,
+                )
 
-        offload_train(actor_trains)
-        if args.offload_rollout and not release_train:
-            ray.get(rollout_manager.onload_weights.remote())
-        was_paused = ray.get(rollout_manager.pause_rollout_admission.remote())
-        actor_model.update_weights()
-        # Final evaluation uses the synchronized engines directly. Keep training
-        # producers paused when no later rollout will consume their new work.
-        if rollout_id + 1 < args.num_rollout:
-            ray.get(rollout_manager.resume_rollout_admission.remote(was_paused))
+            offload_train(actor_trains)
+            if args.offload_rollout and not release_train:
+                ray.get(rollout_manager.onload_weights.remote())
+            was_paused = ray.get(rollout_manager.pause_rollout_admission.remote())
+            actor_model.update_weights()
+            # Final evaluation uses the synchronized engines directly. Keep training
+            # producers paused when no later rollout will consume their new work.
+            if rollout_id + 1 < args.num_rollout:
+                ray.get(rollout_manager.resume_rollout_admission.remote(was_paused))
 
-        if args.offload_rollout:
-            ray.get(rollout_manager.onload_kv.remote())
+            if args.offload_rollout:
+                ray.get(rollout_manager.onload_kv.remote())
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                eval_dispatcher.dispatch(rollout_id, force=(rollout_id == args.num_rollout - 1))
+
+    finally:
+        # Settle every in-flight eval (and GC its snapshots) before teardown.
+        eval_dispatcher.close()
 
 
 def main(args, restore_plan):

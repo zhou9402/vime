@@ -416,6 +416,12 @@ class RolloutManager:
         )
         log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
+    def report_eval_skip(self, rollout_id, reason):
+        """Record a skipped eval point; under --ci-test every skip fails the run."""
+        logger.warning(f"eval point rollout_id={rollout_id} skipped: {reason}")
+        if getattr(self.args, "ci_test", False):
+            raise RuntimeError(f"eval point {rollout_id} skipped under --ci-test: {reason}")
+
     def save(self, rollout_id):
         # Keep admission frozen across source and builder snapshots. Source.save
         # preserves this pre-existing pause instead of resuming between files.

@@ -918,6 +918,40 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
+        def add_eval_fleet_arguments(parser):
+            # Non-blocking, snapshot-based eval (port of miles eval_dispatch/eval_fleet).
+            parser.add_argument(
+                "--eval-hf-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Staging directory for per-eval HF snapshots at {eval_hf_dir}/step_{rollout_id} "
+                    "(tmpfs recommended). Required for snapshot eval (--eval-num-gpus or a "
+                    "CheckpointEvalFn); save points are never reused as eval snapshots."
+                ),
+            )
+            parser.add_argument(
+                "--eval-max-in-flight",
+                type=int,
+                default=2,
+                help="Max concurrently pending async evals before the overflow policy applies.",
+            )
+            parser.add_argument(
+                "--eval-overflow-policy",
+                type=str,
+                choices=["backpressure", "skip"],
+                default="backpressure",
+                help="backpressure awaits the oldest pending eval; skip drops the point (eval/skipped_busy).",
+            )
+            parser.add_argument(
+                "--eval-keep-snapshots",
+                type=int,
+                default=2,
+                help="How many exported eval snapshot dirs to keep under --eval-hf-dir.",
+            )
+
+            return parser
+
         def add_algo_arguments(parser):
             parser.add_argument(
                 "--pg-loss-type",
@@ -1783,6 +1817,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_fault_tolerance_arguments(parser)
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
+        parser = add_eval_fleet_arguments(parser)
         parser = add_algo_arguments(parser)
         parser = add_on_policy_distillation_arguments(parser)
         parser = add_wandb_arguments(parser)
@@ -2091,6 +2126,13 @@ def vime_validate_args(args):
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
+
+    # Snapshot-based eval activates once the eval fleet (F06-2) or a
+    # CheckpointEvalFn (F06-3) provides snapshot consumers; until then the
+    # dispatcher falls back to the blocking shared-engine path.
+    args.eval_uses_snapshots = bool(getattr(args, "eval_num_gpus", 0))
+    if getattr(args, "eval_hf_dir", None) is not None:
+        assert args.eval_interval is not None, "--eval-hf-dir requires --eval-interval."
 
     if importlib.util.find_spec("straw") is None:
         if args.rollout_data_transport == "straw":

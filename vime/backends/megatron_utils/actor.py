@@ -683,6 +683,18 @@ class MegatronTrainRayActor(TrainRayActor):
         elif self.args.offload_train:
             destroy_process_groups()
 
+    def export_hf(self, rollout_id: int, hf_dir: str) -> None:
+        """Export the current actor weights as a complete HF snapshot for eval.
+
+        Every rank participates (save_hf_model_to_path shards the write); a
+        marker file lets the eval side distinguish a finished export.
+        """
+        from .hf_checkpoint_saver import save_hf_model_to_path
+
+        save_hf_model_to_path(self.args, Path(hf_dir), self.model)
+        if dist.get_rank() == 0:
+            Path(hf_dir, ".vime_hf_export_complete").write_text(f"rollout_id={rollout_id}\n")
+
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = (
             self.args.load,
