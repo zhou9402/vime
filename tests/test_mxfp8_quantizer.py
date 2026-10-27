@@ -157,12 +157,14 @@ def test_dispatcher_routes_mxfp8():
     assert out[1][0] == "model.layers.0.mlp.gate_up_proj.weight_scale"
 
 
-def test_dispatcher_raises_on_nvfp4_until_ported():
+def test_dispatcher_routes_nvfp4():
+    # NVFP4 export is implemented by quantizer_nvfp4 (F08-4); routed experts
+    # only. Dense attention weights pass through unquantized.
     weight = torch.randn(8, 64, dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="NVFP4"):
-        processors.quantize_params(
-            _args(),
-            "module.module.decoder.layers.0.mlp.linear_fc1.weight",
-            [("model.layers.0.mlp.gate_up_proj.weight", weight)],
-            {"quant_method": "modelopt_fp4"},
-        )
+    out = processors.quantize_params(
+        _args(),
+        "module.module.decoder.layers.0.self_attention.linear_proj.weight",
+        [("model.layers.0.self_attn.o_proj.weight", weight)],
+        {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+    )
+    assert len(out) == 1 and out[0][1] is weight

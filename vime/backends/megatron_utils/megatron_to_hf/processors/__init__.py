@@ -23,11 +23,15 @@ def quantize_params(args, megatron_name, converted_named_params, quantization_co
 
         return quantize_params_mxfp8(args, megatron_name, converted_named_params, quantization_config)
 
-    if quantization_config["quant_method"] in ("nvfp4", "NVFP4", "modelopt_fp4"):
-        raise NotImplementedError(
-            f"quant_method {quantization_config['quant_method']!r} requires the NVFP4 quantizer "
-            "(F08-3/F08-4, not yet ported); refusing to silently pass BF16 weights through."
-        )
+    # NVFP4 checkpoints: quant_algo "NVFP4" with quant_method "modelopt" /
+    # "modelopt_fp4", or a bare "nvfp4" quant_method.
+    if (
+        quantization_config.get("quant_algo") == "NVFP4"
+        or quantization_config["quant_method"] in ("nvfp4", "NVFP4", "modelopt_fp4")
+    ):
+        from .quantizer_nvfp4 import quantize_params_nvfp4
+
+        return quantize_params_nvfp4(args, megatron_name, converted_named_params, quantization_config)
 
     # Unknown quant method (e.g. mxfp4) — pass through BF16 params as-is
     return converted_named_params
