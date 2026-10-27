@@ -44,6 +44,15 @@ from vime.backends.megatron_utils.megatron_to_hf.qwen3_next import convert_qwen3
 from vime.backends.megatron_utils.megatron_to_hf.qwen3_omni import convert_qwen3_omni_to_hf
 from vime.backends.megatron_utils.megatron_to_hf.qwen3moe import convert_qwen3moe_to_hf
 
+from tests.converters.harness import (
+    DictReader,
+    assert_hf_logits_preserved,
+    assert_roundtrip_bitwise,
+    dense_megatron_param_names,
+    export_args,
+    load_tiny_config,
+)
+
 NUM_GPUS = 0
 
 
@@ -458,6 +467,39 @@ def test_reader_dequantizes_block_scaled_fp8(tmp_path):
 
     assert loaded.dtype == torch.bfloat16
     assert torch.equal(loaded, weight.to(torch.bfloat16) * 2)
+
+
+@pytest.mark.unit
+def test_tiny_harness_qwen3_roundtrip_bitwise():
+    config = load_tiny_config("qwen3")
+    args = export_args(config)
+    reader = _tiny_hf_state_dict(config)
+    params = {
+        name: qwen_hf_tensor(name, reader, config)
+        for name in dense_megatron_param_names(config)
+    }
+    assert_roundtrip_bitwise(qwen_hf_tensor, convert_qwen2_to_hf, args, config, params)
+
+
+@pytest.mark.unit
+def test_tiny_harness_qwen3_logits_preserved():
+    config = load_tiny_config("qwen3")
+    assert_hf_logits_preserved(
+        config,
+        qwen_hf_tensor,
+        convert_qwen2_to_hf,
+        export_args(config),
+        dense_megatron_param_names(config),
+    )
+
+
+def _tiny_hf_state_dict(config):
+    from transformers import AutoModelForCausalLM
+
+    from tests.converters.harness import hf_config_from_tiny
+
+    torch.manual_seed(0)
+    return DictReader(AutoModelForCausalLM.from_config(hf_config_from_tiny(config)).state_dict())
 
 
 if __name__ == "__main__":

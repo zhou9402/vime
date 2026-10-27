@@ -13,3 +13,4 @@
    ../advanced/on-policy-distillation.md
    ../advanced/megatron-config.md
    ../advanced/arch-support-beyond-megatron.md
+   ../advanced/model-converter-harness.md
