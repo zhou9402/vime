@@ -31,3 +31,12 @@ slime 原有 `perf/actor_train_tflops`。MFU 分子来自 HF-config FLOPs 模型
 `vime/utils/device_flops.py` 内置设备表（NVIDIA A100/H100/H200/GH200/
 B200/B300/GB200/GB300 与 AMD MI300X/MI325X/MI355X）。两者都不可得时不记录
 `perf/mfu*` 指标。
+
+## 指标历史存储
+
+`tests/ci/metric_history/storage/` 定义指标历史契约（`MetricHistoryStore`、
+`RunIdentity`、`RunProvenance`）及 SQLite 后端。baseline 按
+`(test_path, backend, suite)` 隔离；比较坐标是 `(metric_key, step)`；
+信任标记在 run 级别，可通过 `mark_untrusted`（按 `run_id`、`ci_run_id`
+或 `commit_sha`）撤销。provenance 列使用 CI 中性命名（`ci_run_id` =
+Buildkite build 号，`ci_run_attempt` = 重试次数，`pipeline` = pipeline 名）。

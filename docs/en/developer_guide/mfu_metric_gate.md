@@ -34,3 +34,13 @@ cached per checkpoint); the denominator is `--mfu-peak-tflops` when set, else
 the built-in device table in `vime/utils/device_flops.py` (NVIDIA A100/H100/
 H200/GH200/B200/B300/GB200/GB300 and AMD MI300X/MI325X/MI355X). When neither is
 available for the local device, no `perf/mfu*` keys are logged.
+
+## Metric-history store
+
+`tests/ci/metric_history/storage/` defines the metric-history contract
+(`MetricHistoryStore`, `RunIdentity`, `RunProvenance`) and a SQLite backend.
+A run's baseline is scoped by `(test_path, backend, suite)`; the comparison
+coordinate is `(metric_key, step)`; trust is a run-level flag revocable via
+`mark_untrusted` (by `run_id`, `ci_run_id`, or `commit_sha`). Provenance
+columns use CI-neutral names (`ci_run_id` = Buildkite build number,
+`ci_run_attempt` = retry count, `pipeline` = pipeline slug).
