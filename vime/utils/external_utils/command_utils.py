@@ -90,6 +90,7 @@ class ExecuteTrainConfig:
     cuda_core_dump: bool = False
     num_nodes: int = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
     extra_env_vars: str = ""
+    train_script: str = "train.py"  # entry point; train_multi_policy.py for multi-policy runs
 
 
 def execute_train(
@@ -184,7 +185,7 @@ def execute_train(
             exec_command(
                 f"export {amd_exports} && "
                 f"{cmd_megatron_model_source}"
-                f"python3 train.py {model_args} {train_args}"
+                f"python3 {config.train_script} {model_args} {train_args}"
             )
         else:
             exec_command(
@@ -192,7 +193,7 @@ def execute_train(
                 f"{cmd_megatron_model_source}"
                 f'ray job submit --address="http://127.0.0.1:8265" '
                 f"--runtime-env-json='{runtime_env_json}' "
-                f"-- python3 train.py "
+                f"-- python3 {config.train_script} "
                 f"{model_args} "
                 f"{train_args}"
             )
