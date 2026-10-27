@@ -17,10 +17,15 @@ def test_p2p_flags_defaults_and_parse():
     parser = add_p2p_weight_transfer_arguments(argparse.ArgumentParser())
     args = parser.parse_args([])
     assert args.p2p_transfer_timeout == 30.0
-    assert args.check_weight_transfer_checksum is False
-    args = parser.parse_args(["--p2p-transfer-timeout", "7.5", "--check-weight-transfer-checksum"])
+    args = parser.parse_args(["--p2p-transfer-timeout", "7.5"])
     assert args.p2p_transfer_timeout == 7.5
-    assert args.check_weight_transfer_checksum is True
+
+
+def test_p2p_group_does_not_redefine_f02_checksum_flag():
+    # --check-weight-transfer-checksum is owned by F02's add_weight_check_arguments;
+    # registering it here too would break the combined parser with a duplicate flag.
+    parser = add_p2p_weight_transfer_arguments(argparse.ArgumentParser())
+    assert "--check-weight-transfer-checksum" not in parser._option_string_actions
 
 
 def _factory_args(**overrides):

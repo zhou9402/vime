@@ -12,13 +12,6 @@ def add_p2p_weight_transfer_arguments(parser):
             "errored. Only used with --update-weight-transport=p2p."
         ),
     )
-    parser.add_argument(
-        "--check-weight-transfer-checksum",
-        action="store_true",
-        default=False,
-        help=(
-            "Compute per-tensor SHA-256 checksums on the sender and have each engine verify the staged "
-            "bytes before loading them (p2p transport). Costs a CPU pass over every bucket."
-        ),
-    )
+    # NOTE: --check-weight-transfer-checksum is owned by F02's
+    # add_weight_check_arguments (arguments.py); p2p consumes args.check_weight_transfer_checksum.
     return parser

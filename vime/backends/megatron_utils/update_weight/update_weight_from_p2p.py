@@ -25,6 +25,7 @@ import torch.distributed as dist
 from vime.utils.distributed_utils import get_gloo_group
 from vime.utils.weight_sync import should_flush_cache
 
+from .checksum_utils import hash_tensor_sha256
 from .p2p import (
     MooncakeTransport,
     RemoteShard,
@@ -68,10 +69,6 @@ def _engine_call(engine: Any, method: str, *args, **kwargs) -> Any:
 
         return ray.get(fn.remote(*args, **kwargs))
     return fn(*args, **kwargs)
-
-
-def _sha256(tensor: torch.Tensor) -> str:
-    return hashlib.sha256(tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
 
 
 class UpdateWeightFromP2P:
@@ -170,12 +167,24 @@ class UpdateWeightFromP2P:
             target = self._targets[engine_ind]
             if target.is_errored:
                 return None
-            # collective_rpc fans out to every worker of the engine; index by rank.
-            # Non-node-0 actors answer [] (they serve no HTTP): skip them.
-            infos = _engine_call(self.rollout_engines[engine_ind], "get_p2p_transfer_info")
-            if not infos or engine_rank >= len(infos):
-                return None
-            return infos[engine_rank]
+
+            # Control-plane calls (not data writes) may be retried on transient
+            # transport errors (miles #4402 lineage); data writes never are.
+            def query() -> dict | None:
+                # collective_rpc fans out to every worker of the engine; index by
+                # rank. Non-node-0 actors answer [] (they serve no HTTP): skip.
+                infos = _engine_call(self.rollout_engines[engine_ind], "get_p2p_transfer_info")
+                if not infos or engine_rank >= len(infos):
+                    return None
+                return infos[engine_rank]
+
+            from vime.utils.retry_utils import retry_until_deadline_sync
+
+            return retry_until_deadline_sync(
+                query,
+                total_seconds=self.args.p2p_transfer_timeout,
+                retry_if=_is_transient_control_error,
+            )
 
         engine_cell_ids = [f"engine-{i}" for i in range(len(self.rollout_engines))]
         self._shards_by_rank = self._transport.connect(
@@ -229,6 +238,7 @@ class UpdateWeightFromP2P:
             self._send_bucket(dict(bucket))
         if self._buffers is not None:
             self._buffers.wait_for_all_writes()
+        _quarantine_errored_engines(self._targets, self.weight_version)
         _gloo_barrier()
 
         if self._driver_rank() == 0:
@@ -261,7 +271,7 @@ class UpdateWeightFromP2P:
         if self._buffers is None:
             return
         checksums = (
-            {name: _sha256(tensor) for name, tensor in bucket.items()}
+            {name: hash_tensor_sha256(tensor) for name, tensor in bucket.items()}
             if self.args.check_weight_transfer_checksum
             else None
         )
@@ -341,6 +351,38 @@ class UpdateWeightFromP2P:
                 f"engine {shard.rollout_engine_ind} rank {shard.rollout_engine_rank} returned "
                 "checksums that differ from the sender's"
             )
+
+
+def _quarantine_errored_engines(targets: list[_EngineTarget], weight_version: int) -> None:
+    """All trainer ranks quarantine the same engines (gloo all-gather of errored indices).
+
+    miles _mark_cells_errored_on_any_rank equivalent: without this, one sender rank could
+    observe a failure its peers did not, and the ranks would disagree about which engines
+    are safe to keep serving.
+    """
+    locally_errored = {t.engine_index for t in targets if t.errored_at_version == weight_version}
+    for engine_index in _union_over_gloo(locally_errored) - locally_errored:
+        targets[engine_index].mark_errored(
+            RuntimeError("engine errored on another trainer rank"), weight_version
+        )
+
+
+def _union_over_gloo(local: set[int]) -> set[int]:
+    if not dist.is_initialized():
+        return local
+    gathered: list[set[int]] = [set() for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, local, group=get_gloo_group())
+    return set().union(local, *gathered)
+
+
+def _is_transient_control_error(error: BaseException) -> bool:
+    import json as _json
+
+    import requests
+
+    if isinstance(error, _json.JSONDecodeError) and not error.doc:
+        return True
+    return isinstance(error, (requests.ConnectionError, requests.Timeout))
 
 
 def _gloo_barrier() -> None:

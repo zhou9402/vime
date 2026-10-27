@@ -74,6 +74,7 @@ class FakeEngine:
     def __init__(self, params_source: dict[str, torch.Tensor], num_ranks: int = 1, node_rank: int = 0):
         self.node_rank = node_rank
         self.shutdown_called = False
+        self.info_failures = 0  # transient control-plane failures to inject
         self.ranks = [
             {name: torch.empty_like(tensor) for name, tensor in params_source.items()}
             for _ in range(num_ranks)
@@ -91,6 +92,11 @@ class FakeEngine:
     def get_p2p_transfer_info(self) -> list[dict]:
         if self.node_rank != 0:
             return []  # only the node-0 actor serves HTTP (VLLMEngine._collective_rpc)
+        if self.info_failures:
+            self.info_failures -= 1
+            import requests
+
+            raise requests.ConnectionError("simulated transient control-plane failure")
         return [
             {
                 "session_id": f"fake-session-{id(self):x}-{rank}",
@@ -323,3 +329,34 @@ def test_bucket_is_packed_once_for_multiple_assignments(monkeypatch):
     for rank_params in engine.ranks:
         for name, tensor in weights.items():
             assert torch.equal(rank_params[name], tensor), name
+
+
+def test_transient_control_plane_error_is_retried():
+    """connect() queries may be retried (miles #4402); data writes never are."""
+    weights = _source_weights()
+    engines = [FakeEngine(weights)]
+    engines[0].info_failures = 2  # first two get_p2p_transfer_info calls fail
+    updater = _make_updater(weights, engines, FakeTransferEngine())
+    updater.update_weights()
+    for name, tensor in weights.items():
+        assert torch.equal(engines[0].ranks[0][name], tensor), name
+
+
+def test_quarantine_union_marks_engines_errored_on_other_ranks():
+    """An engine that errored on any trainer rank is quarantined on all of them."""
+    from vime.backends.megatron_utils.update_weight.update_weight_from_p2p import (
+        _EngineTarget,
+        _quarantine_errored_engines,
+    )
+    import vime.backends.megatron_utils.update_weight.update_weight_from_p2p as p2p_updater
+
+    targets = [_EngineTarget(0), _EngineTarget(1)]
+    targets[0].mark_errored(RuntimeError("boom"), weight_version=3)
+    p2p_updater._union_over_gloo_orig = getattr(p2p_updater, "_union_over_gloo")
+    try:
+        p2p_updater._union_over_gloo = lambda local: local | {1}
+        _quarantine_errored_engines(targets, weight_version=3)
+    finally:
+        p2p_updater._union_over_gloo = p2p_updater._union_over_gloo_orig
+    assert targets[1].is_errored
+    assert targets[1].errored_at_version == 3
