@@ -18,7 +18,10 @@ distributed, disk-delta) with four mechanisms:
    `--check-weight-update-allow-quant-error` (quantized tensors compared in
    dequantized space, ≤1 ULP per side). Engine-side snapshots are **hashes-only**
    by default (no CPU copy); `--check-weight-update-snapshot full` stores CPU
-   copies for `reset_tensors` restore semantics.
+   copies, enabling quant-tolerant value compare and the separate `restore`
+   action. `reset_tensors` CLOBBERS live weights with a deterministic zero
+   sentinel (never restores): the startup flow snapshot -> reset -> update ->
+   compare proves the first update overwrites every tensor.
 3. **Atomic update groups** — HF-name suffixes whose tensors a vLLM loader fuses
    into one engine parameter (e.g. DeepSeek `wq_a` + `wkv`) are never split
    across update buckets. fp8 weight+scale pairs are always emitted as one unit.

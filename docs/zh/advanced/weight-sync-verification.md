@@ -14,7 +14,9 @@ vime 在全部三条权重同步路径(colocate IPC、NCCL distributed、disk-de
    `--check-weight-update-skip-list`(按子串降级为非致命)、
    `--check-weight-update-allow-quant-error`(量化 tensor 在反量化空间比较,每侧 ≤1 ULP)。
    engine 侧 snapshot 默认**只存哈希**(不做 CPU 拷贝);
-   `--check-weight-update-snapshot full` 才存 CPU 副本以支持 `reset_tensors` 恢复。
+   `--check-weight-update-snapshot full` 才存 CPU 副本,用于含量化容差的值比较和单独的
+   `restore` 动作。`reset_tensors` 用确定性的零哨兵**覆写**在线权重(绝不恢复):
+   启动流程 snapshot -> reset -> update -> compare 证明首次更新确实改写了每个 tensor。
 3. **原子更新组** — vLLM loader 会融合成单个 engine 参数的 HF 后缀组
    (如 DeepSeek `wq_a` + `wkv`)绝不跨桶拆分;fp8 weight+scale 永远作为一个单元发出。
 4. **weight-version 过期守卫** — 断言每次更新后 driver 都发布 weight version,

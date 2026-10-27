@@ -6,9 +6,6 @@ snapshot/compare/reset semantics (the server-side half lands in F02-2's vLLM
 patch). For each vime weight-sync path (colocate IPC, NCCL distributed,
 disk-delta) the test syncs weights, flips one bit engine-side, and requires
 ``check_weights(action="compare")`` to raise, naming the tampered tensor.
-
-Until F02-2 implements ``VLLMEngine.check_weights`` the detection tests are
-xfail(strict=True) and the stub behavior is asserted explicitly.
 """
 
 from __future__ import annotations
@@ -45,8 +42,10 @@ class _FakeVLLMServer:
 
     This mirrors the F02-2 server contract: ``snapshot`` records per-tensor
     SHA-256 hashes (no CPU copies), ``compare`` reports per-tensor
-    match/mismatch against the snapshot, ``reset_tensors`` is a no-op for
-    hashes-only mode (nothing was copied out).
+    match/mismatch against the snapshot, and ``reset_tensors`` CLOBBERS the
+    live weights with a deterministic zero sentinel (never restores), so the
+    startup flow snapshot -> reset -> update -> compare proves the first
+    update overwrites every tensor.
     """
 
     def __init__(self) -> None:
@@ -63,19 +62,24 @@ class _FakeVLLMServer:
         buf[0] ^= 1  # one-bit flip
 
     def handle_check_weights(self, payload: dict) -> dict:
+        """Worker-level RPC result; VLLMEngine.check_weights wraps the list of
+        per-worker results into the body evaluated by weight_checker."""
         action = payload["action"]
         if action == "snapshot":
             self._snapshot_hashes = {name: _sha256(t) for name, t in self.tensors.items()}
-            return {"ok": True, "supported": True, "action": action, "results": []}
+            return {"rank": 0, "tensors": {}}
         if action == "reset_tensors":
-            return {"ok": True, "supported": True, "action": action, "results": []}
+            # Clobber, never restore: prove the next update rewrites every tensor.
+            for tensor in self.tensors.values():
+                tensor.view(torch.uint8).zero_()
+            return {"rank": 0, "tensors": {name: {"status": "clobbered"} for name in self.tensors}}
         if action == "compare":
             assert self._snapshot_hashes, "compare without snapshot"
             results = {}
             for name, tensor in self.tensors.items():
                 status = "match" if _sha256(tensor) == self._snapshot_hashes.get(name) else "mismatch"
                 results[name] = {"status": status}
-            return {"ok": True, "supported": True, "action": action, "results": [{"rank": 0, "tensors": results}]}
+            return {"rank": 0, "tensors": results}
         raise ValueError(f"unknown check_weights action {action!r}")
 
 
@@ -132,8 +136,8 @@ def engine_and_server(monkeypatch):
     server = _FakeVLLMServer()
 
     def fake_post(url, json=None, **kwargs):
-        if url.endswith("/check_weights"):
-            return _MockResponse(server.handle_check_weights(json))
+        if url.endswith("/collective_rpc") and json.get("method") == "check_weights":
+            return _MockResponse([server.handle_check_weights(json["kwargs"])])
         raise AssertionError(f"unexpected POST {url} {json!r}")
 
     monkeypatch.setattr(mod.requests, "post", fake_post)
@@ -149,7 +153,6 @@ def _trainer_weights() -> dict[str, torch.Tensor]:
 
 
 @pytest.mark.parametrize("sync_path", _SYNC_PATHS)
-@pytest.mark.xfail(strict=True, reason="F02-2 implements the check_weights RPC; stub cannot detect tampering")
 def test_tampered_weight_detected(engine_and_server, sync_path):
     """After a sync, a 1-bit engine-side flip must make check_weights compare fail."""
     engine, server = engine_and_server
@@ -161,19 +164,55 @@ def test_tampered_weight_detected(engine_and_server, sync_path):
 
 
 @pytest.mark.parametrize("sync_path", _SYNC_PATHS)
-@pytest.mark.xfail(strict=True, reason="F02-2 implements the check_weights RPC; stub returns supported=False")
 def test_untampered_weight_passes(engine_and_server, sync_path):
     """No tamper -> check_weights compare must pass cleanly."""
     engine, server = engine_and_server
     server.load_weights(_trainer_weights())
     engine.check_weights(action="snapshot")
     result = engine.check_weights(action="compare")  # must not raise
-    assert result.get("supported") is True, "check_weights RPC must be implemented (F02-2)"
+    assert result["supported"] is True
 
 
-def test_check_weights_stub_reports_unsupported(engine_and_server):
-    """Pre-F02-2 gap: the engine stub declines weight checks. This test pins the
-    stub contract; F02-2 replaces it with the real RPC and this test."""
-    engine, _server = engine_and_server
+def test_check_weights_uses_collective_rpc(engine_and_server):
+    """The engine-side implementation is the vLLM check_weights worker method
+    (docker/patch/latest/vllm-check-weights.patch), reached via /collective_rpc."""
+    engine, server = engine_and_server
+    server.load_weights(_trainer_weights())
     result = engine.check_weights(action="snapshot")
-    assert result == {"ok": True, "supported": False}
+    assert result["supported"] is True
+    assert server._snapshot_hashes, "snapshot must reach the fake server"
+
+
+@pytest.mark.parametrize("sync_path", _SYNC_PATHS)
+def test_reset_clobbers_then_update_restores_equality(engine_and_server, sync_path):
+    """Startup contract: snapshot -> reset_tensors (clobber) -> compare must FAIL
+    -> trainer update lands -> compare must PASS. Proves the first update
+    overwrites every tensor."""
+    engine, server = engine_and_server
+    server.load_weights(_trainer_weights())  # initial engine weights
+    engine.check_weights(action="snapshot")
+    engine.check_weights(action="reset_tensors")
+    with pytest.raises(RuntimeError, match="gate_proj"):
+        engine.check_weights(action="compare")
+    server.load_weights(_trainer_weights())  # first real update via `sync_path`
+    engine.check_weights(action="compare")  # must not raise
+
+
+def test_nonzero_node_rank_returns_accepted_noop(engine_and_server):
+    """2-node fan-out: node_rank != 0 engines must return a reply the
+    check_weights parsers accept without hitting the HTTP server."""
+    from vime.backends.vllm_utils.weight_checker import evaluate_compare_results
+
+    engine, _server = engine_and_server
+    engine.node_rank = 1
+    result = engine.check_weights(action="compare")
+    assert result == {"ok": True, "supported": True, "results": []}
+    # The manager aggregates per-engine bodies; an empty node body must not fail.
+    evaluate_compare_results(result)
+    evaluate_compare_results(
+        {
+            "ok": True,
+            "supported": True,
+            "results": result["results"] + [{"rank": 0, "tensors": {"w": {"status": "match"}}}],
+        }
+    )

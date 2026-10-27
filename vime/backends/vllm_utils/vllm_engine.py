@@ -386,9 +386,59 @@ class VLLMEngine(RayActor):
             return {"ok": True}
         return response.json()
 
-    def check_weights(self, action: str):
-        del action
-        return {"ok": True, "supported": False}
+    def check_weights(
+        self,
+        action: str,
+        *,
+        selector: str = "all",
+        skip_list: list[str] | None = None,
+        allow_quant_error: bool = False,
+        snapshot_mode: str | None = None,
+    ):
+        """Run a weight-verification action on the engine via collective_rpc.
+
+        ``action`` is one of ``snapshot`` / ``compare`` / ``reset_tensors``
+        (miles check_weights semantics). Snapshots are hashes-only unless
+        ``snapshot_mode="full"`` (CPU copies, enables value-based compare with
+        quant tolerance and true reset_tensors restore). A ``compare`` with
+        non-skipped mismatches raises RuntimeError.
+        """
+        if self.node_rank != 0:
+            # Only node-0 serves HTTP; other ranks return a reply the
+            # check_weights parsers accept as a no-op.
+            return {"ok": True, "supported": True, "results": []}
+        if snapshot_mode is None:
+            snapshot_mode = getattr(self.args, "check_weight_update_snapshot", "hashes")
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/collective_rpc",
+            json={
+                "method": "check_weights",
+                "kwargs": {
+                    "action": action,
+                    "selector": selector,
+                    "skip_tensor_list": skip_list or [],
+                    "allow_quant_error": allow_quant_error,
+                    "snapshot_mode": snapshot_mode,
+                },
+            },
+        )
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            e.add_note(f"{response.text=}")
+            raise
+        worker_results = response.json()
+        body = {
+            "ok": True,
+            "supported": True,
+            "action": action,
+            "results": worker_results if isinstance(worker_results, list) else [worker_results],
+        }
+        if action == "compare":
+            from vime.backends.vllm_utils.weight_checker import evaluate_compare_results
+
+            evaluate_compare_results(body, skip_list=skip_list)
+        return body
 
     def init_weight_transfer_engine(self, payload: dict) -> dict:
         return self._make_request("init_weight_transfer_engine", payload)

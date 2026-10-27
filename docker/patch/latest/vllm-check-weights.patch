@@ -1,0 +1,174 @@
+diff --git a/vllm/utils/weight_checker.py b/vllm/utils/weight_checker.py
+new file mode 100644
+index 0000000000..538e9c8f05
+--- /dev/null
++++ b/vllm/utils/weight_checker.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Weight-sync verification for RL training (snapshot / compare / reset).
++
++The trainer drives this through the generic ``/collective_rpc`` endpoint:
++``Worker.check_weights`` -> ``run_check_weights``. Actions:
++
++- ``snapshot``: record the selected weights. ``snapshot_mode="hashes"``
++  (default) stores only per-tensor SHA-256 hashes; ``"full"`` also stores CPU
++  clones, enabling quant-tolerant value compare and the ``restore`` action.
++- ``compare``: compare current weights against the snapshot. Hashes mode is
++  exact; full mode with ``allow_quant_error`` compares in float32 with a small
++  tolerance so quantized tensors may differ by ~1 ULP per side.
++- ``reset_tensors``: CLOBBER the selected live weights with a deterministic
++  zero sentinel. Used at startup to prove the first weight update overwrites
++  every tensor: after reset, ``compare`` must FAIL; after a correct update,
++  ``compare`` must PASS. Never restores.
++- ``restore``: copy full-mode snapshot tensors back into the live model
++  (requires ``snapshot_mode="full"``).
++
++``selector``: ``"all"`` / ``"target"`` (main model) / ``"draft"`` (speculative
++draft model, when present). ``skip_tensor_list`` entries report ``"skipped"``;
++the caller decides whether a mismatch is fatal.
++
++Per-worker return: ``{"rank", "tensors", "checksums"}``; the collective_rpc
++response is the list over workers.
++"""
++
++import hashlib
++from typing import Any
++
++import torch
++
++_SNAPSHOT_HASHES: dict[str, str] = {}
++_SNAPSHOT_TENSORS: dict[str, torch.Tensor] = {}
++
++
++def _sha256(tensor: torch.Tensor) -> str:
++    return hashlib.sha256(
++        tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
++    ).hexdigest()
++
++
++def _iter_selected_tensors(worker, selector: str):
++    model = worker.model_runner.model
++    if selector in ("all", "target"):
++        yield from model.named_parameters()
++        yield from model.named_buffers()
++    if selector in ("all", "draft"):
++        drafter = getattr(worker.model_runner, "drafter", None)
++        draft_model = getattr(drafter, "model", None) if drafter else None
++        if draft_model is not None:
++            yield from draft_model.named_parameters()
++
++
++def run_check_weights(
++    worker,
++    *,
++    action: str,
++    selector: str = "all",
++    skip_tensor_list: list[str] | None = None,
++    allow_quant_error: bool = False,
++    snapshot_mode: str = "hashes",
++) -> dict[str, Any]:
++    if action not in ("snapshot", "compare", "reset_tensors", "restore"):
++        raise ValueError(f"unknown check_weights action {action!r}")
++    if snapshot_mode not in ("hashes", "full"):
++        raise ValueError(f"unknown check_weights snapshot_mode {snapshot_mode!r}")
++    skip_tensor_list = skip_tensor_list or []
++    rank = getattr(worker, "rank", 0)
++    tensors = dict(_iter_selected_tensors(worker, selector))
++
++    if action == "snapshot":
++        _SNAPSHOT_HASHES.clear()
++        _SNAPSHOT_TENSORS.clear()
++        for name, tensor in tensors.items():
++            _SNAPSHOT_HASHES[name] = _sha256(tensor)
++            if snapshot_mode == "full":
++                _SNAPSHOT_TENSORS[name] = tensor.detach().cpu().clone()
++        return {"rank": rank, "tensors": {}, "checksums": dict(_SNAPSHOT_HASHES)}
++
++    if action == "reset_tensors":
++        # Clobber, never restore: prove the next update rewrites every tensor.
++        for tensor in tensors.values():
++            tensor.view(torch.uint8).zero_()
++        return {
++            "rank": rank,
++            "tensors": {name: {"status": "clobbered"} for name in tensors},
++            "checksums": {},
++        }
++
++    if action == "restore":
++        if not _SNAPSHOT_TENSORS:
++            raise RuntimeError(
++                "check_weights restore requires snapshot_mode='full' snapshots"
++            )
++        restored = {}
++        for name, snapshot in _SNAPSHOT_TENSORS.items():
++            if name in tensors and not torch.equal(tensors[name].detach().cpu(), snapshot):
++                tensors[name].copy_(snapshot.to(tensors[name].device))
++                restored[name] = {"status": "restored"}
++        return {"rank": rank, "tensors": restored, "checksums": dict(_SNAPSHOT_HASHES)}
++
++    # compare
++    if not _SNAPSHOT_HASHES:
++        raise RuntimeError("check_weights compare before snapshot")
++    results: dict[str, dict[str, str]] = {}
++    for name, tensor in tensors.items():
++        if any(pattern in name for pattern in skip_tensor_list):
++            results[name] = {"status": "skipped"}
++            continue
++        if name not in _SNAPSHOT_HASHES:
++            results[name] = {"status": "missing"}
++            continue
++        if snapshot_mode == "full" and name in _SNAPSHOT_TENSORS:
++            status = _compare_values(tensor, _SNAPSHOT_TENSORS[name], allow_quant_error)
++        else:
++            status = "match" if _sha256(tensor) == _SNAPSHOT_HASHES[name] else "mismatch"
++        results[name] = {"status": status}
++    return {
++        "rank": rank,
++        "tensors": results,
++        "checksums": {name: _sha256(tensor) for name, tensor in tensors.items()},
++    }
++
++
++def _compare_values(current: torch.Tensor, snapshot: torch.Tensor, allow_quant_error: bool) -> str:
++    current_cpu = current.detach().cpu()
++    if not allow_quant_error:
++        return "match" if torch.equal(current_cpu, snapshot) else "mismatch"
++    # Quantized tensors may legitimately differ by ~1 ULP per side; compare in
++    # dequantized (float32) space with a small tolerance.
++    ok = torch.allclose(current_cpu.float(), snapshot.float(), rtol=1e-3, atol=1e-3)
++    return "match" if ok else "mismatch"
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 8040416279..7733577b52 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1520,6 +1520,30 @@ class Worker(WorkerBase):
+         if self.weight_transfer_engine is not None:
+             self.weight_transfer_engine.shutdown()
+ 
++    def check_weights(
++        self,
++        action: str,
++        selector: str = "all",
++        skip_tensor_list: list[str] | None = None,
++        allow_quant_error: bool = False,
++        snapshot_mode: str = "hashes",
++    ) -> dict[str, Any]:
++        """Verify weight-sync integrity (vime RL weight updates).
++
++        Actions: snapshot / compare / reset_tensors (clobber) / restore.
++        See vllm/utils/weight_checker.py for the contract.
++        """
++        from vllm.utils.weight_checker import run_check_weights
++
++        return run_check_weights(
++            self,
++            action=action,
++            selector=selector,
++            skip_tensor_list=skip_tensor_list,
++            allow_quant_error=allow_quant_error,
++            snapshot_mode=snapshot_mode,
++        )
++
+     def start_weight_update(self) -> None:
+         """Start a new weight update session.
+ 

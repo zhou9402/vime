@@ -232,6 +232,7 @@ COPY docker/patch/${PATCH_VERSION}/vllm-rust-server-info.patch /tmp/vllm-rust-se
 COPY docker/patch/${PATCH_VERSION}/vllm-deepgemm-bf16.patch /tmp/vllm-deepgemm-bf16.patch
 COPY docker/patch/${PATCH_VERSION}/vllm-deepep-optional-shrink.patch /tmp/vllm-deepep-optional-shrink.patch
 COPY docker/patch/${PATCH_VERSION}/vllm-draft-weights-cpu-backup.patch /tmp/vllm-draft-weights-cpu-backup.patch
+COPY docker/patch/${PATCH_VERSION}/vllm-check-weights.patch /tmp/vllm-check-weights.patch
 RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" && \
     cd "$VLLM_SITE" && \
     git apply -v /tmp/vllm-pull_weights.patch && \
@@ -240,6 +241,7 @@ RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirn
     git apply -v /tmp/vllm-pd-request-metrics.patch && \
     git apply -v /tmp/vllm-inflight-queue-diagnostics.patch && \
     git apply -v /tmp/vllm-retained-serving.patch && \
+    git apply -v /tmp/vllm-check-weights.patch && \
     git apply -v /tmp/vllm-generation-health.patch && \
     git apply -v /tmp/vllm-tensor-dump.patch && \
     git apply -v /tmp/vllm-fine-grained-tracing.patch && \
@@ -257,6 +259,7 @@ RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirn
        /tmp/vllm-pd-request-metrics.patch \
        /tmp/vllm-inflight-queue-diagnostics.patch \
        /tmp/vllm-retained-serving.patch \
+       /tmp/vllm-check-weights.patch \
        /tmp/vllm-generation-health.patch \
        /tmp/vllm-tensor-dump.patch \
        /tmp/vllm-fine-grained-tracing.patch \

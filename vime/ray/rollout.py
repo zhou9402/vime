@@ -500,9 +500,13 @@ class RolloutManager:
             self.servers = ray.get(self.serving.health_monitoring_resume.remote())
             return
 
-    def check_weights(self, action: str):
+    def check_weights(self, action: str, **kwargs):
         return ray.get(
-            [engine.check_weights.remote(action=action) for engine in self.rollout_engines if engine is not None]
+            [
+                engine.check_weights.remote(action=action, **kwargs)
+                for engine in self.rollout_engines
+                if engine is not None
+            ]
         )
 
     def _get_rollout_data(self, rollout_id):
