@@ -66,6 +66,7 @@ class RolloutManager:
         self.controller = deployment.controller if deployment else None
         self._owns_controller = False
         self.weight_version = None
+        self._policy_binding = None
         self.training_weight_version = getattr(args, "update_weight_start_version", 0)
         if args.rollout_data_transport == "straw":
             check_rollout_storage(args)
@@ -267,17 +268,15 @@ class RolloutManager:
         if self.recovery is not None:
             self.recovery.checkpoint_committed(rollout_id)
 
-    def get_weight_version(self):
+    def get_weight_version(self, model_id=None):
+        from vime.utils.multi_policy.serving_config import consistent_weight_version
+
         if self.serving is not None:
-            return ray.get(self.serving.get_weight_version.remote())
-        server = self._get_updatable_server()
+            return ray.get(self.serving.get_weight_version.remote(model_id))
+        server = self._get_updatable_server(model_id)
         engines = [engine for engine in server.engines if engine is not None] if server else []
         versions = ray.get([engine.get_weight_version.remote() for engine in engines])
-        if not versions:
-            return None
-        if len(set(versions)) != 1 or not str(versions[0]).isdigit():
-            raise RuntimeError(f"Cannot checkpoint inconsistent serving weight versions: {versions}")
-        return int(versions[0])
+        return consistent_weight_version(versions)
 
     @property
     def server(self) -> Any | None:
@@ -286,35 +285,47 @@ class RolloutManager:
             return None
         return next(iter(self.servers.values()))
 
-    def _get_updatable_server(self) -> Any | None:
+    def _get_updatable_server(self, model_id=None) -> Any | None:
         """Return the server with ``update_weights=True``.
 
-        When multiple updatable servers exist, returns the first one
-        (multi-model weight update is not yet supported).
+        With ``model_id=None`` and multiple updatable servers, returns the
+        first one (legacy single-policy behavior). With a model_id, returns the
+        server bound to that policy by --multi-policy-config (binding validated
+        once, then cached).
         """
-        return next((server for server in self.servers.values() if server.update_weights), None)
+        from vime.utils.multi_policy.serving_config import bind_policy_servers, resolve_updatable_server
+
+        if model_id is not None and self._policy_binding is None:
+            config = getattr(self.args, "multi_policy", None)
+            if config is None:
+                raise ValueError(f"model_id {model_id!r} given but the run has no --multi-policy-config")
+            self._policy_binding = bind_policy_servers(self.servers, config)
+        return resolve_updatable_server(self.servers, model_id, self._policy_binding)
 
     @property
     def rollout_engines(self):
         """All node-0 engines across all servers / models."""
         return [e for srv in self.servers.values() for e in srv.engines]
 
-    def get_updatable_engines_and_lock(self):
+    def get_updatable_engines_and_lock(self, model_id=None):
         """Return engines eligible for weight updates.
 
-        Returns engines from the first model that has
+        With ``model_id=None``, returns engines from the first model that has
         ``update_weights=True``.  Frozen models (reference, reward,
-        etc.) are automatically excluded.
+        etc.) are automatically excluded. With a model_id, returns the engines
+        of the server bound to that policy.
         """
         if self.serving is not None:
-            return ray.get(self.serving.get_updatable_engines_and_lock.remote())
-        srv = self._get_updatable_server()
+            return ray.get(self.serving.get_updatable_engines_and_lock.remote(model_id))
+        srv = self._get_updatable_server(model_id)
         engines = srv.engines if srv else []
         gpu_counts = srv.engine_gpu_counts if srv else []
         gpu_offsets = srv.engine_gpu_offsets if srv else []
         parallel_configs = srv.engine_parallel_configs if srv else []
         num_new = srv.num_new_engines if srv else 0
-        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets, parallel_configs
+        # The lock the server itself holds (per-policy in multi-policy runs).
+        lock = (srv.engine_lock if srv is not None and srv.engine_lock is not None else None) or self.rollout_engine_lock
+        return engines, lock, num_new, gpu_counts, gpu_offsets, parallel_configs
 
     def get_num_rollout_per_epoch(self):
         return len(self.data_source) // self.args.rollout_batch_size

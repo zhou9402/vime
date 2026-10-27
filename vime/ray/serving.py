@@ -49,6 +49,8 @@ class ServingCluster:
         self.router_processes = []
         self.controller = None
         self.lock = None
+        self._policy_locks = {}
+        self._policy_binding = None
         self.driver_job_id = None
         self.training_actors = {}
         self.attachments = 0
@@ -69,6 +71,7 @@ class ServingCluster:
                 ]
             ray.get(handles)
             self.lock = Lock.options(num_cpus=0, num_gpus=0).remote()
+            self._attach_policy_config()
         except BaseException:
             try:
                 self.dispose()
@@ -153,8 +156,7 @@ class ServingCluster:
                 [group for server in self.servers.values() for group in server.server_groups],
                 timeout=args.rollout_health_check_timeout,
             )
-            ray.kill(self.lock, no_restart=True)
-            self.lock = Lock.options(num_cpus=0, num_gpus=0).remote()
+            self._recreate_locks()
             server = self._updatable_server()
             if server:
                 # Healthy engines are also new peers from the trainer's point
@@ -175,6 +177,7 @@ class ServingCluster:
         for name, value in self.deployment().routers.items():
             setattr(args, name, value)
         self.args = args
+        self._attach_policy_config()
         self.driver_job_id = job_id
         self.attachments += 1
         return self.deployment(reused)
@@ -218,40 +221,74 @@ class ServingCluster:
         # Keep engines, routers, placements and the queue for the next attempt.
         self.driver_job_id = None
 
-    def _updatable_server(self):
-        return next((server for server in self.servers.values() if server.update_weights), None)
+    def _recreate_locks(self):
+        """Kill and recreate the global lock and every per-policy lock.
 
-    def get_updatable_engines_and_lock(self):
-        server = self._updatable_server()
+        A possibly held lock belongs to the old trainer; the next update
+        reconnects through fresh actors. Server engine_lock references are
+        reassigned by the _attach_policy_config() call that follows a reattach.
+        """
+        ray.kill(self.lock, no_restart=True)
+        self.lock = Lock.options(num_cpus=0, num_gpus=0).remote()
+        for policy_lock in self._policy_locks.values():
+            ray.kill(policy_lock, no_restart=True)
+        self._policy_locks = {}
+
+    def _attach_policy_config(self):
+        """Validate the policy->server binding ONCE and hand each server its lock.
+
+        Every RolloutServer holds an ``engine_lock``: policy servers get a
+        dedicated per-policy lock, everything else shares the global
+        ``self.lock``. Called from __init__ and whenever training re-attaches
+        (locks and possibly the config are recreated there).
+        """
+        from vime.utils.multi_policy.serving_config import bind_policy_servers
+
+        config = getattr(self.args, "multi_policy", None)
+        self._policy_binding = bind_policy_servers(self.servers, config) if config is not None else None
+        policy_server_names = set(self._policy_binding.values()) if self._policy_binding else set()
+        for name, server in self.servers.items():
+            if name in policy_server_names:
+                if name not in self._policy_locks:
+                    self._policy_locks[name] = Lock.options(num_cpus=0, num_gpus=0).remote()
+                server.engine_lock = self._policy_locks[name]
+            else:
+                server.engine_lock = self.lock
+
+    def _updatable_server(self, model_id=None):
+        from vime.utils.multi_policy.serving_config import resolve_updatable_server
+
+        return resolve_updatable_server(self.servers, model_id, self._policy_binding)
+
+    def get_engine_lock(self, model_id=None):
+        """The lock the policy's server itself holds; global lock for single-policy runs."""
+        if model_id is None:
+            return self.lock
+        server = self._updatable_server(model_id)
+        return server.engine_lock if server is not None else self.lock
+
+    def get_updatable_engines_and_lock(self, model_id=None):
+        server = self._updatable_server(model_id)
         if server is None:
-            return [], self.lock, 0, [], [], []
+            return [], self.get_engine_lock(model_id), 0, [], [], []
         return (
             server.engines,
-            self.lock,
+            self.get_engine_lock(model_id),
             server.num_new_engines,
             server.engine_gpu_counts,
             server.engine_gpu_offsets,
             server.engine_parallel_configs,
         )
 
-    def get_weight_version(self, *, allow_inconsistent=False):
-        server = self._updatable_server()
+    def get_weight_version(self, model_id=None, *, allow_inconsistent=False):
+        from vime.utils.multi_policy.serving_config import consistent_weight_version
+
+        server = self._updatable_server(model_id)
         engines = [engine for engine in server.engines if engine is not None] if server else []
         versions = ray.get(
             [engine.get_weight_version.remote() for engine in engines], timeout=self.args.rollout_health_check_timeout
         )
-        if not versions:
-            return None
-        if allow_inconsistent:
-            # A partial update or a replacement engine may have no version yet.
-            # Seed the restart from the highest installed version so publishing
-            # restored checkpoint weights does not move the version backwards.
-            return max((int(version) for version in versions if str(version).isdigit()), default=0)
-        if any(not str(version).isdigit() for version in versions):
-            raise RuntimeError(f"Cannot resume nonnumeric serving weight versions: {versions}")
-        if len(set(versions)) != 1:
-            raise RuntimeError(f"Cannot checkpoint inconsistent serving weight versions: {versions}")
-        return int(versions[0])
+        return consistent_weight_version(versions, allow_inconsistent=allow_inconsistent)
 
     def recover_updatable_engines(self):
         # Recovery waits until the trainer can immediately install its weights.
@@ -329,6 +366,9 @@ class ServingCluster:
                 cleanup.run("terminate queue controller", ray.kill, self.controller, no_restart=True)
             if self.lock is not None:
                 cleanup.run("terminate weight lock", ray.kill, self.lock, no_restart=True)
+            for policy_lock in self._policy_locks.values():
+                cleanup.run("terminate policy weight lock", ray.kill, policy_lock, no_restart=True)
+            self._policy_locks = {}
             # Colocated actor/critic/rollout entries can share the same placement.
             for group in {placement[0] for placement in self.placements.values() if placement and placement[0]}:
                 cleanup.run("remove serving placement", remove_placement_group, group)

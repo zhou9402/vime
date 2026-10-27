@@ -12,4 +12,5 @@ Understand policy objectives, precision, parallelism, and memory.
    ../advanced/reproducibility.md
    ../advanced/on-policy-distillation.md
    ../advanced/megatron-config.md
+   ../advanced/multi-policy-config.md
    ../advanced/arch-support-beyond-megatron.md

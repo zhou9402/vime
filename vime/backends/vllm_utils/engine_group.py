@@ -306,6 +306,9 @@ class RolloutServer:
     prometheus_port: int | None = None
     model_name: str = "default"
     update_weights: bool = True
+    # Weight-update serialization lock held by ServingCluster: a dedicated
+    # per-policy lock for policy servers, the shared global lock otherwise.
+    engine_lock: object = None
 
     @property
     def engines(self):
