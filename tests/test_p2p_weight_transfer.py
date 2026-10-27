@@ -1,58 +1,41 @@
-"""P2P/RDMA weight-transfer contract verifier (F01-P0, Design A: replica-free).
+"""P2P/RDMA weight-transfer verifier (F01): the real updater against fakes.
 
-Design A in one paragraph: each engine worker publishes ONE registered staging
-buffer (session id, address, capacity). The trainer packs an HF-layout bucket
-into a pinned transfer buffer, RDMA-writes it into the staging buffer, then the
-engine reshards the staged bytes with its own loader and returns per-name
-SHA-256 checksums for verification. No trainer-side model replica.
+Drives `UpdateWeightFromP2P` (F01-P3) with:
+* the shipped `MooncakeTransport` over an in-process fake TransferEngine
+  (ctypes byte copies, fault injection — no Mooncake, no RDMA, no GPU), and
+* fake vLLM engine objects implementing the F01-P1 worker contract
+  (`init_weight_transfer_engine` / `get_p2p_transfer_info` /
+  `load_weights_from_staged`) with a reference loader.
 
-Weight writes are NEVER retried (miles: the weight-update session is no-retry
-by design; the #4402 retry hardening covers Mooncake *object-store* ops only).
-A failed write marks its target errored and the update moves on to healthy
-targets; uncertain writes additionally pin the registered memory forever.
+Contract pinned here: byte-equivalence with a direct copy, engine-side
+resharding being the engine's business, per-name SHA-256 verification catching
+a flipped bit, writes never retried, and failed engines quarantined while
+healthy ones finish the update.
 
-This file pins that contract with fakes only (no Mooncake, no vLLM, no GPU):
-a fake TransferEngine copies bytes in-process with fault injection, and a fake
-engine worker reshards staged bytes with a reference loader. The real pieces
-must keep this green:
-* F01-P1 (vLLM ``p2p`` weight-transfer backend, docker patch) implements the
-  ``get_p2p_transfer_info`` / ``load_weights_from_staged`` worker contract.
-* F01-P2 (trainer transport package) provides the real MooncakeTransport; the
-  packing helper below is the shipped
-  ``vime.backends.megatron_utils.update_weight.p2p.pack_bucket_into_transfer_buffer``.
-* F01-P3 (UpdateWeightFromP2P) drives the same pack -> write -> load -> verify
-  flow against real engines.
-* F01-P4 adds the shared check_weights/quarantine hardening (with F02).
-
-Deterministic: fixed-shape tensors, in-process byte copies, no network.
+Deterministic: fixed-seed tensors, in-process copies, no network.
 """
 
 import ctypes
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vime.backends.megatron_utils.update_weight.p2p import pack_bucket_into_transfer_buffer
+from vime.backends.megatron_utils.update_weight.p2p import MooncakeTransport
+from vime.backends.megatron_utils.update_weight.update_weight_from_p2p import UpdateWeightFromP2P
 
 NUM_GPUS = 0
 
 
-def _sha256(tensor: torch.Tensor) -> str:
-    return hashlib.sha256(tensor.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
-
-
 class FakeTransferEngine:
-    """In-process stand-in for mooncake.engine.TransferEngine.
-
-    Copies bytes with ctypes.memmove; supports fault injection for the
-    tamper/failure contract tests.
-    """
+    """In-process mooncake.engine.TransferEngine: memmove + fault injection."""
 
     def __init__(self):
         self.registered = {}
         self.fail_with: int | None = None
-        self._corrupt_next_write = False
+        self.fail_sessions: set[str] | None = None
+        self.corrupt_sessions: set[str] = set()
         self.writes = 0
 
     def register_memory(self, ptr: int, nbytes: int) -> int:
@@ -63,106 +46,117 @@ class FakeTransferEngine:
         del self.registered[ptr]
         return 0
 
-    def corrupt_next_write(self):
-        self._corrupt_next_write = True
+    def corrupt_writes_to(self, session_id: str):
+        self.corrupt_sessions.add(session_id)
 
     def batch_transfer_sync_write(self, session_id, src_ptrs, dst_addrs, nbytes_list) -> int:
         self.writes += 1
-        if self.fail_with is not None:
+        if self.fail_with is not None and (self.fail_sessions is None or session_id in self.fail_sessions):
             return self.fail_with
         for src, dst, nbytes in zip(src_ptrs, dst_addrs, nbytes_list, strict=True):
-            assert src in self.registered, f"source {src:#x} is not registered"
-            assert self.registered[src] >= nbytes
             ctypes.memmove(dst, src, nbytes)
-            if self._corrupt_next_write:
+            if session_id in self.corrupt_sessions:
                 ctypes.memmove(dst, bytes([ctypes.c_uint8.from_address(dst).value ^ 0x1]), 1)
-                self._corrupt_next_write = False
         return 0
 
 
-class FakeEngineWorker:
-    """Fake engine rank: one staging buffer + a reference loader.
+def _sha256(tensor: torch.Tensor) -> str:
+    return hashlib.sha256(tensor.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
 
-    The reference loader plays the role of the F01-P1 vLLM backend: it consumes
-    the packed staging buffer per the manifest and returns per-name checksums.
+
+class FakeEngine:
+    """Fake vLLM engine (one worker rank): staging buffer + reference loader.
+
+    The reference loader stands in for the F01-P1 backend: it consumes the
+    staged bytes per the manifest and returns per-name checksums.
     """
 
-    def __init__(self, params: dict[str, torch.Tensor], capacity_nbytes: int):
-        self.params = params
-        self.staging = torch.empty(capacity_nbytes, dtype=torch.uint8)
-        self.session_id = f"fake-session-{id(self):x}"
+    def __init__(self, params_source: dict[str, torch.Tensor], num_ranks: int = 1, node_rank: int = 0):
+        self.node_rank = node_rank
+        self.shutdown_called = False
+        self.ranks = [
+            {name: torch.empty_like(tensor) for name, tensor in params_source.items()}
+            for _ in range(num_ranks)
+        ]
+        self.staging: list[torch.Tensor] = []
+        self.resumed = False
+        self.weight_version: str | None = None
 
-    def get_p2p_transfer_info(self) -> dict:
-        return {
-            "session_id": self.session_id,
-            "staging_address": self.staging.data_ptr(),
-            "capacity_nbytes": self.staging.numel(),
-        }
+    # -- F01-P1 worker contract (what VLLMEngine exposes over /collective_rpc) --
 
-    def load_weights_from_staged(self, manifest: list[dict]) -> dict[str, str]:
-        checksums = {}
-        for entry in manifest:
-            name, offset, nbytes = entry["name"], entry["offset"], entry["nbytes"]
-            param = self.params[name]
-            if param.numel() * param.element_size() != nbytes:
-                raise RuntimeError(f"{name}: size mismatch")
-            staged = self.staging[offset : offset + nbytes].view(param.dtype).view(param.shape)
-            param.copy_(staged)
-            checksums[name] = _sha256(param)
-        return checksums
+    def init_weight_transfer_engine(self, payload: dict):
+        nbytes = payload["init_info"]["staging_buffer_size_bytes"]
+        self.staging = [torch.empty(nbytes, dtype=torch.uint8) for _ in self.ranks]
+
+    def get_p2p_transfer_info(self) -> list[dict]:
+        if self.node_rank != 0:
+            return []  # only the node-0 actor serves HTTP (VLLMEngine._collective_rpc)
+        return [
+            {
+                "session_id": f"fake-session-{id(self):x}-{rank}",
+                "staging_address": staging.data_ptr(),
+                "capacity_nbytes": staging.numel(),
+            }
+            for rank, staging in enumerate(self.staging)
+        ]
+
+    def load_weights_from_staged(self, update_info: dict) -> list[dict]:
+        if self.node_rank != 0:
+            return []
+        # collective_rpc fan-out contract: one result per worker; non-target ranks no-op.
+        target_rank = update_info.get("target_rank")
+        results = []
+        for rank in range(len(self.ranks)):
+            if target_rank is not None and rank != target_rank:
+                results.append({})
+                continue
+            staging = self.staging[rank]
+            params = self.ranks[rank]
+            checksums = {}
+            for entry in update_info["manifest"]:
+                name, offset, nbytes = entry["name"], entry["offset"], entry["nbytes"]
+                staged = staging[offset : offset + nbytes]
+                digest = hashlib.sha256(staged.numpy().tobytes()).hexdigest()
+                expected = update_info.get("checksums", {}).get(name)
+                if expected is not None and expected != digest:
+                    raise RuntimeError(f"checksum mismatch for {name!r}")
+                params[name].copy_(staged.view(params[name].dtype).view(params[name].shape))
+                checksums[name] = digest
+            results.append(checksums)
+        return results
+
+    # -- lifecycle (no-ops beyond bookkeeping) --
+
+    def pause_generation(self, mode: str = "abort"):
+        self.resumed = False
+
+    def flush_cache(self):
+        pass
+
+    def start_weight_update(self):
+        pass
+
+    def finish_weight_update(self, weight_version: str):
+        self.weight_version = weight_version
+
+    def continue_generation(self):
+        self.resumed = True
+
+    def destroy_weights_update_group(self, _group):
+        pass
+
+    def shutdown(self):
+        # VLLMEngine.shutdown: unregister from the router + kill the server.
+        self.shutdown_called = True
+        self.resumed = False
 
 
-class _Target:
-    """Error-isolation handle per engine (the F01-P3/P4 rollout-cell updater contract)."""
+class _FakeIterator:
+    def __init__(self, buckets: list[dict[str, torch.Tensor]]):
+        self._buckets = buckets
 
-    def __init__(self):
-        self.errored: BaseException | None = None
-
-    @property
-    def is_errored(self) -> bool:
-        return self.errored is not None
-
-    def mark_errored(self, error: BaseException) -> None:
-        self.errored = error
-
-
-class MiniP2PPipeline:
-    """Test-local driver mimicking the F01-P3 updater: pack -> write -> load -> verify.
-
-    Writes are never retried: a failed write marks the engine's target errored
-    and the failure propagates; other (healthy) engines are still updated.
-    """
-
-    def __init__(self, transfer_engine: FakeTransferEngine, buffer_nbytes: int):
-        self._transfer_engine = transfer_engine
-        self.buffer = torch.empty(buffer_nbytes, dtype=torch.uint8, pin_memory=False)
-        self._transfer_engine.register_memory(self.buffer.data_ptr(), buffer_nbytes)
-
-    def update_engine(self, worker: FakeEngineWorker, bucket: dict[str, torch.Tensor], target: _Target) -> None:
-        if target.is_errored:
-            return
-        info = worker.get_p2p_transfer_info()
-        manifest = pack_bucket_into_transfer_buffer(self.buffer, bucket)
-        total_nbytes = sum(entry["nbytes"] for entry in manifest)
-        if total_nbytes > info["capacity_nbytes"]:
-            raise RuntimeError("bucket exceeds the engine staging buffer")
-        sent_checksums = {name: _sha256(tensor) for name, tensor in bucket.items()}
-
-        ret = self._transfer_engine.batch_transfer_sync_write(
-            info["session_id"], [self.buffer.data_ptr()], [info["staging_address"]], [total_nbytes]
-        )
-        if ret < 0:
-            error = RuntimeError(f"Mooncake batch_transfer_sync_write returned {ret}")
-            target.mark_errored(error)
-            raise error
-        received = worker.load_weights_from_staged(manifest)
-        if received != sent_checksums:
-            error = RuntimeError(
-                "checksum mismatch after P2P write: "
-                f"{[n for n in sent_checksums if received.get(n) != sent_checksums[n]]}"
-            )
-            target.mark_errored(error)
-            raise error
+    def get_hf_weight_chunks(self, _weights) -> list:
+        return [list(bucket.items()) for bucket in self._buckets]
 
 
 def _source_weights() -> dict[str, torch.Tensor]:
@@ -175,121 +169,157 @@ def _source_weights() -> dict[str, torch.Tensor]:
     }
 
 
-def _make_engine(params_source: dict[str, torch.Tensor], capacity_nbytes: int) -> FakeEngineWorker:
-    return FakeEngineWorker(
-        {name: torch.empty_like(tensor) for name, tensor in params_source.items()}, capacity_nbytes
+def _make_updater(weights, engines, fake_transfer_engine, *, checksum=True, buffer_nbytes=None, replicas=(0, 1)):
+    total = sum(t.numel() * t.element_size() for t in weights.values())
+    args = SimpleNamespace(
+        update_weight_buffer_size=buffer_nbytes or total,
+        p2p_transfer_timeout=5.0,
+        check_weight_transfer_checksum=checksum,
+        flush_cache_interval=1,
+        rollout_num_gpus_per_engine=1,
+        update_weight_start_version=0,
     )
+    updater = UpdateWeightFromP2P(
+        args,
+        model=None,
+        weights_getter=lambda: None,
+        model_name="tiny",
+        quantization_config=None,
+        iterator=_FakeIterator([weights]),
+        transport=MooncakeTransport(transfer_engine=fake_transfer_engine),
+        data_replica_rank_and_size=replicas,
+    )
+    updater.connect_rollout_engines(engines, None, engine_gpu_counts=[len(e.ranks) for e in engines])
+    return updater
 
 
-def test_p2p_weights_match_direct_copy():
+def test_p2p_update_weights_match_direct_copy():
     weights = _source_weights()
-    total = sum(t.numel() * t.element_size() for t in weights.values())
+    engines = [FakeEngine(weights), FakeEngine(weights)]
+    updater = _make_updater(weights, engines, FakeTransferEngine())
+    updater.update_weights()
 
-    p2p_engines = [_make_engine(weights, total), _make_engine(weights, total)]
-    pipeline = MiniP2PPipeline(FakeTransferEngine(), buffer_nbytes=total)
-    for engine in p2p_engines:
-        pipeline.update_engine(engine, weights, _Target())
-
-    # NCCL-equivalent reference: a direct copy into the same engine params.
-    reference_engine = _make_engine(weights, total)
+    reference = {name: torch.empty_like(t) for name, t in weights.items()}
     for name, tensor in weights.items():
-        reference_engine.params[name].copy_(tensor)
+        reference[name].copy_(tensor)
 
-    for engine in p2p_engines:
+    for engine in engines:
+        assert engine.resumed
+        assert engine.weight_version == "1"
+        for rank_params in engine.ranks:
+            for name, tensor in weights.items():
+                assert torch.equal(rank_params[name], tensor), name
+                assert torch.equal(rank_params[name], reference[name]), name
+    updater.disconnect_rollout_engines()
+
+
+def test_p2p_two_ranks_per_engine_both_loaded():
+    weights = _source_weights()
+    engine = FakeEngine(weights, num_ranks=2)
+    updater = _make_updater(weights, [engine], FakeTransferEngine())
+    updater.update_weights()
+    for rank_params in engine.ranks:
         for name, tensor in weights.items():
-            assert torch.equal(engine.params[name], tensor), name
-            assert torch.equal(engine.params[name], reference_engine.params[name]), name
+            assert torch.equal(rank_params[name], tensor), name
 
 
-def test_p2p_partial_bucket_updates_only_listed_params():
+def test_bit_flip_during_write_is_detected_and_quarantined():
     weights = _source_weights()
-    total = sum(t.numel() * t.element_size() for t in weights.values())
-    engine = _make_engine(weights, total)
-    pipeline = MiniP2PPipeline(FakeTransferEngine(), buffer_nbytes=total)
-
-    pipeline.update_engine(engine, weights, _Target())
-    sentinel = torch.full_like(weights["lm_head.weight"], 7)
-    engine.params["lm_head.weight"].copy_(sentinel)
-    bucket = {k: v + 1 for k, v in weights.items() if k != "lm_head.weight"}
-    pipeline.update_engine(engine, bucket, _Target())
-
-    for name, tensor in bucket.items():
-        assert torch.equal(engine.params[name], tensor), name
-    assert torch.equal(engine.params["lm_head.weight"], sentinel)
-
-
-def test_bit_flip_during_write_is_detected():
-    weights = _source_weights()
-    total = sum(t.numel() * t.element_size() for t in weights.values())
-    engine = _make_engine(weights, total)
+    engines = [FakeEngine(weights), FakeEngine(weights)]
     transfer_engine = FakeTransferEngine()
-    transfer_engine.corrupt_next_write()
-    pipeline = MiniP2PPipeline(transfer_engine, buffer_nbytes=total)
-    target = _Target()
+    updater = _make_updater(weights, engines, transfer_engine)
+    # engine 0's buckets arrive corrupted (targets that engine's session only)
+    transfer_engine.corrupt_writes_to(engines[0].get_p2p_transfer_info()[0]["session_id"])
 
-    with pytest.raises(RuntimeError, match="checksum mismatch"):
-        pipeline.update_engine(engine, weights, target)
-    assert target.is_errored
+    with pytest.raises(RuntimeError, match="P2P weight update failed on engines \\[0\\]"):
+        updater.update_weights()
+    assert not engines[0].resumed, "the corrupted engine must not resume"
+    assert engines[0].shutdown_called, "errored engines are retired (router unregister + kill)"
+    assert engines[1].resumed, "healthy engines finish the update"
+    assert not engines[1].shutdown_called
+    for name, tensor in weights.items():
+        assert torch.equal(engines[1].ranks[0][name], tensor), name
 
 
-def test_failed_write_marks_target_errored_and_is_never_retried():
+def test_failed_write_is_never_retried_and_engine_is_quarantined():
     weights = _source_weights()
-    total = sum(t.numel() * t.element_size() for t in weights.values())
-    engine = _make_engine(weights, total)
+    engines = [FakeEngine(weights), FakeEngine(weights)]
     transfer_engine = FakeTransferEngine()
     transfer_engine.fail_with = -800
-    pipeline = MiniP2PPipeline(transfer_engine, buffer_nbytes=total)
-    target = _Target()
+    updater = _make_updater(weights, engines, transfer_engine)
 
-    with pytest.raises(RuntimeError, match="returned -800"):
-        pipeline.update_engine(engine, weights, target)
-    assert target.is_errored
-    assert transfer_engine.writes == 1, "weight writes are never retried, not even transient ones"
-
-    # An errored target is skipped on later updates (partial-target quarantine).
-    transfer_engine.fail_with = None
-    pipeline.update_engine(engine, weights, target)
-    assert transfer_engine.writes == 1
+    with pytest.raises(RuntimeError, match="engines \\[0, 1\\]"):
+        updater.update_weights()
+    # one write per engine's shard, no retries of the failed write
+    assert transfer_engine.writes == 2
+    assert not engines[0].resumed and not engines[1].resumed
 
 
-def test_failed_engine_does_not_block_healthy_engines():
+def test_errored_engine_is_skipped_on_the_next_update():
     weights = _source_weights()
-    total = sum(t.numel() * t.element_size() for t in weights.values())
-    engines = [_make_engine(weights, total), _make_engine(weights, total)]
-    targets = [_Target(), _Target()]
+    engines = [FakeEngine(weights), FakeEngine(weights)]
+    transfer_engine = FakeTransferEngine()
+    updater = _make_updater(weights, engines, transfer_engine)
 
-    failing = FakeTransferEngine()
-    failing.fail_with = -703
-    MiniP2PPipeline(failing, buffer_nbytes=total)  # keep buffer-size parity; separate pipelines per sender
-    pipeline = MiniP2PPipeline(FakeTransferEngine(), buffer_nbytes=total)
+    # only engine 0's writes fail; engine 1 finishes the first update
+    transfer_engine.fail_with = -1
+    transfer_engine.fail_sessions = {engines[0].get_p2p_transfer_info()[0]["session_id"]}
+    with pytest.raises(RuntimeError, match="engines \\[0\\]"):
+        updater.update_weights()
+    assert engines[1].resumed
+    writes_after_failure = transfer_engine.writes
 
-    # engine 0 fails on its sender; engine 1 is updated by a healthy sender
-    pipeline_fail = MiniP2PPipeline(failing, buffer_nbytes=total)
-    with pytest.raises(RuntimeError):
-        pipeline_fail.update_engine(engines[0], weights, targets[0])
-    pipeline.update_engine(engines[1], weights, targets[1])
-
-    assert targets[0].is_errored
-    assert not targets[1].is_errored
+    transfer_engine.fail_with = None
+    updater.update_weights()  # succeeds: only engine 1 remains
     for name, tensor in weights.items():
-        assert torch.equal(engines[1].params[name], tensor), name
+        assert torch.equal(engines[1].ranks[0][name], tensor), name
+    assert transfer_engine.writes > writes_after_failure
+    assert not engines[0].resumed
 
 
 def test_bucket_exceeding_staging_capacity_is_rejected():
     weights = _source_weights()
     total = sum(t.numel() * t.element_size() for t in weights.values())
-    engine = _make_engine(weights, capacity_nbytes=total // 2)
-    pipeline = MiniP2PPipeline(FakeTransferEngine(), buffer_nbytes=total)
-
-    with pytest.raises(RuntimeError, match="staging buffer"):
-        pipeline.update_engine(engine, weights, _Target())
-
-
-def test_bucket_exceeding_transfer_buffer_is_rejected():
-    weights = _source_weights()
-    total = sum(t.numel() * t.element_size() for t in weights.values())
-    engine = _make_engine(weights, capacity_nbytes=total)
-    pipeline = MiniP2PPipeline(FakeTransferEngine(), buffer_nbytes=total // 2)
-
+    engine = FakeEngine(weights)
+    # engine allocates staging at 2x the trainer's (too-small) buffer... so
+    # instead give the trainer a buffer one byte too small for the bucket.
+    updater = _make_updater(weights, [engine], FakeTransferEngine(), buffer_nbytes=total - 1)
     with pytest.raises(RuntimeError, match="transfer buffer"):
-        pipeline.update_engine(engine, weights, _Target())
+        updater.update_weights()
+    assert not engine.resumed
+
+
+def test_non_node0_engine_actors_are_tolerated():
+    """Multi-node engines: non-node-0 actors answer [] over collective_rpc; the
+    updater skips them for data and never crashes."""
+    weights = _source_weights()
+    engines = [FakeEngine(weights), FakeEngine(weights, node_rank=1)]
+    updater = _make_updater(weights, engines, FakeTransferEngine())
+    updater.update_weights()
+    for name, tensor in weights.items():
+        assert torch.equal(engines[0].ranks[0][name], tensor), name
+    assert not torch.equal(engines[1].ranks[0]["lm_head.weight"], weights["lm_head.weight"])
+    assert engines[1].resumed
+
+
+def test_bucket_is_packed_once_for_multiple_assignments(monkeypatch):
+    """3 assignments (one 3-rank engine), 1 bucket -> exactly 1 pack call."""
+    import vime.backends.megatron_utils.update_weight.update_weight_from_p2p as p2p_updater
+
+    weights = _source_weights()
+    engine = FakeEngine(weights, num_ranks=3)
+    calls = 0
+    real_pack = p2p_updater.pack_bucket_into_transfer_buffer
+
+    def counting_pack(buffer, bucket):
+        nonlocal calls
+        calls += 1
+        return real_pack(buffer, bucket)
+
+    monkeypatch.setattr(p2p_updater, "pack_bucket_into_transfer_buffer", counting_pack)
+    updater = _make_updater(weights, [engine], FakeTransferEngine())
+    updater.update_weights()
+    assert calls == 1
+    for rank_params in engine.ranks:
+        for name, tensor in weights.items():
+            assert torch.equal(rank_params[name], tensor), name

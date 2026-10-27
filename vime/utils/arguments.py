@@ -153,12 +153,14 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--update-weight-transport",
-                choices=["nccl", "disk"],
+                choices=["nccl", "disk", "p2p"],
                 default="nccl",
                 help=(
-                    "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks and "
+                    "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks, "
                     "'disk' writes a complete HF checkpoint under --update-weight-disk-dir "
-                    "before engines reload it. Delta mode is 'disk' only: each host applies the "
+                    "before engines reload it, and 'p2p' (disaggregated only) RDMA-writes "
+                    "buckets into engine-published staging buffers via Mooncake (vime[p2p]). "
+                    "Delta mode is 'disk' only: each host applies the "
                     "published deltas into its local checkpoint and reloads via update_weights_from_disk."
                 ),
             )
@@ -1844,6 +1846,11 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_mtp_training_arguments(parser)
         parser = add_dspark_training_arguments(parser)
         parser = add_ci_arguments(parser)
+        from vime.backends.megatron_utils.update_weight.p2p.arguments import (
+            add_p2p_weight_transfer_arguments,
+        )
+
+        parser = add_p2p_weight_transfer_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         reset_arg(
             parser,
@@ -2412,6 +2419,25 @@ def vime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if args.update_weight_transport == "p2p":
+        if args.colocate:
+            raise ValueError(
+                "P2P weight transfer mode is not compatible with --colocate. "
+                "Please use broadcast mode or disable colocate."
+            )
+        if getattr(args, "prefill_num_servers", None) is not None:
+            raise ValueError("P2P weight transfer mode has not been tested when PD is enabled.")
+        if getattr(args, "lora_rank", 0) > 0:
+            raise ValueError("LoRA weight sync is not supported for p2p (RDMA) weight transfer.")
+        if (
+            getattr(args, "dspark_enabled", False)
+            or getattr(args, "enable_mtp_training", False)
+            or getattr(args, "vllm_speculative_config", None)
+        ):
+            raise ValueError(
+                "Speculative decoding weight sync is not supported for p2p (RDMA) weight transfer."
+            )
 
     # disk-backed sync (full or delta) writes on the trainer and reads on the engines: needs a shared dir
     if args.update_weight_transport == "disk" and not args.update_weight_disk_dir:

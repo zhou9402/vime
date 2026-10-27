@@ -32,6 +32,16 @@ def create_weight_updater(
         from .update_weight_from_disk import UpdateWeightFromDisk
 
         update_weight_cls = UpdateWeightFromDisk
+    elif update_weight_transport == "p2p":
+        # RDMA into engine-published staging buffers; engines reshard with their own
+        # loaders. Disaggregated only (validation rejects colocate/LoRA/spec-decode).
+        if update_weight_mode != "full":
+            raise ValueError("--update-weight-transport=p2p requires --update-weight-mode=full")
+        if args.colocate:
+            raise ValueError("--update-weight-transport=p2p is not supported with --colocate")
+        from .update_weight_from_p2p import UpdateWeightFromP2P
+
+        update_weight_cls = UpdateWeightFromP2P
     elif args.colocate:
         from .update_weight_from_tensor import UpdateWeightFromTensor
 

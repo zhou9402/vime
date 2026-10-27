@@ -456,6 +456,25 @@ class VLLMEngine(RayActor):
             self._weight_version = str(weight_version)
         return result
 
+    def get_p2p_transfer_info(self) -> list[dict]:
+        """Per-worker Mooncake session + staging buffer (p2p weight transfer, F01)."""
+        return self._collective_rpc("get_p2p_transfer_info", {})
+
+    def load_weights_from_staged(self, update_info: dict) -> list[dict]:
+        """Verify + load one RDMA-written staging bucket; per-worker checksums."""
+        return self._collective_rpc("load_weights_from_staged", {"update_info": update_info})
+
+    def _collective_rpc(self, method: str, kwargs: dict) -> list:
+        if self.node_rank != 0:
+            return []
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/collective_rpc",
+            json={"method": method, "kwargs": kwargs},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("results", data) if isinstance(data, dict) else data
+
     def pull_weights(self, target_version: int):
         if self.node_rank != 0:
             return
@@ -811,6 +830,8 @@ def _compute_server_args(
 
     if args.colocate:
         kwargs["weight_transfer_config"] = {"backend": "ipc"}
+    elif getattr(args, "update_weight_transport", "nccl") == "p2p":
+        kwargs["weight_transfer_config"] = {"backend": "p2p"}
     else:
         kwargs["weight_transfer_config"] = {"backend": "nccl"}
 

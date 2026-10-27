@@ -1,7 +1,7 @@
 # P2P / RDMA 权重传输
 
-> 状态:进行中(从 miles @ ba28991834 移植,F01)。verifier 与训练侧传输包先行落地;
-> vLLM 引擎后端与运行开关在后续 PR 合入。本文描述目标设计。
+> 状态:训练侧 updater、传输包、verifier 与 vLLM 引擎 patch 已合入。校验/隔离加固
+> (F01-P4,随 F02)与多机 GPU e2e(F01-P5)待做。
 
 对于**分离部署**(非 colocate)的大规模训练,NCCL 广播权重同步的开销随引擎规模增长。
 P2P 模式改为通过 RDMA(Mooncake transfer engine)直接写入各引擎。miles 的实测数据:
@@ -38,11 +38,17 @@ Kimi-K2 1T:53.3 s → 7.2 s 每次更新)。
 - 完成状态未知的写入("uncertain write")还会永久钉住已注册的传输缓冲内存:此后不再注销。
 - 每个权重桶在到达时做 SHA-256 校验(与通用 `check_weights` 加固 F02 收敛)。
 
-## 用法(目标形态,F01-P3 之后)
+## 用法
 
 ```bash
-python train.py ... --update-weight-transport p2p --p2p-transfer-timeout 30
+# 镜像需以 --build-arg ENABLE_P2P=1 构建(安装 mooncake-transfer-engine)
+python train.py ... --update-weight-transport p2p --p2p-transfer-timeout 30 \
+    --check-weight-transfer-checksum
 ```
+
+p2p 与 `--colocate`、LoRA、投机解码互斥(参数校验直接拒绝)。
+引擎 worker 的暂存缓冲为 1x `--update-weight-buffer-size`(默认 512 MiB):
+每个引擎的写线程把 write -> load 串行化,无需第二个槽位。训练侧传输缓冲为双缓冲。
 
 ## 引擎后端(vLLM patch)
 

@@ -111,4 +111,11 @@ def _wait_for_healthy_targets(pending_writes: list[PendingWrite], timeout: float
 
 def _allocate_transfer_buffer(buffer_nbytes: int, device: torch.device) -> torch.Tensor:
     # host buffers are pinned in place: a pageable copy first would stay resident on aarch64 hosts
-    return torch.empty(buffer_nbytes, dtype=torch.uint8, device=device, pin_memory=device.type == "cpu")
+    if device.type != "cpu":
+        return torch.empty(buffer_nbytes, dtype=torch.uint8, device=device)
+    try:
+        buffer = torch.empty(buffer_nbytes, dtype=torch.uint8, device=device, pin_memory=True)
+        buffer.fill_(0)  # fault the pages in and validate the allocation
+        return buffer
+    except RuntimeError:  # platforms without accelerator pinning (e.g. macOS)
+        return torch.empty(buffer_nbytes, dtype=torch.uint8, device=device)

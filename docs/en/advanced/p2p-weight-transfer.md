@@ -1,9 +1,8 @@
 # P2P / RDMA Weight Transfer
 
-> Status: in progress (F01 port from miles @ ba28991834). The verifier and the
-> trainer-side transport package are landing first; the vLLM engine backend and
-> the runtime flag follow in later PRs. This document describes the target
-> design.
+> Status: trainer updater, transport package, verifier, and the vLLM engine
+> patch are in. Checksum/quarantine hardening (F01-P4, with F02) and the
+> multi-node GPU e2e (F01-P5) are pending.
 
 For **disaggregated** (non-colocated) training at scale, NCCL broadcast weight
 sync cost grows with the engine world size. P2P mode instead writes weights
@@ -50,11 +49,18 @@ lockstep.
 - Per-bucket SHA-256 checksums are verified on arrival (converges with the
   generic `check_weights` hardening, F02).
 
-## Usage (target, after F01-P3)
+## Usage
 
 ```bash
-python train.py ... --update-weight-transport p2p --p2p-transfer-timeout 30
+# image built with --build-arg ENABLE_P2P=1 (installs mooncake-transfer-engine)
+python train.py ... --update-weight-transport p2p --p2p-transfer-timeout 30 \
+    --check-weight-transfer-checksum
 ```
+
+Validation rejects `--colocate`, LoRA, and speculative decoding with p2p.
+Each engine worker's staging buffer is sized 1x `--update-weight-buffer-size`
+(512 MiB default): the per-engine write thread serializes write -> load, so a
+second slot is never used. The trainer's transfer buffers are double-buffered.
 
 ## Engine backend (vLLM patch)
 

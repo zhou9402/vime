@@ -1,0 +1,348 @@
+"""P2P (Mooncake RDMA) weight updater for disaggregated deployments (F01-P3).
+
+Replica-free ("Design A", docs/en/advanced/p2p-weight-transfer.md): the trainer
+packs each HF bucket into a pinned transfer buffer, RDMA-writes it into one
+staging buffer each target engine worker publishes, and the worker reshards the
+staged bytes with its own vLLM `load_weights` (`load_weights_from_staged`).
+
+Only disaggregated (non-colocate) full-mode sync; argument validation rejects
+colocate / LoRA / speculative decoding. Writes are never retried: a failed
+write or checksum verification marks the engine errored (it is skipped for the
+rest of this and later updates), healthy engines finish the update, and the
+update raises at the end if any engine errored.
+"""
+
+import hashlib
+import logging
+import socket
+from argparse import Namespace
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+import torch
+import torch.distributed as dist
+
+from vime.utils.distributed_utils import get_gloo_group
+from vime.utils.weight_sync import should_flush_cache
+
+from .p2p import (
+    MooncakeTransport,
+    RemoteShard,
+    TransferBuffers,
+    assign_rollout_engine_ranks_for_data_replica,
+    pack_bucket_into_transfer_buffer,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class _EngineTarget:
+    """Per-engine error-isolation handle (TransferBuffers' WriteTarget).
+
+    F01-P4 replaces this with the shared rollout-cell quarantine (with F02).
+    """
+
+    def __init__(self, engine_index: int) -> None:
+        self.engine_index = engine_index
+        self.errored: BaseException | None = None
+        # weight_version the error happened in; quarantine is permanent, but an
+        # update only fails for engines that errored during THAT update.
+        self.errored_at_version: int | None = None
+
+    @property
+    def is_errored(self) -> bool:
+        return self.errored is not None
+
+    def mark_errored(self, error: BaseException, weight_version: int | None = None) -> None:
+        if self.errored is None:
+            self.errored = error
+            self.errored_at_version = weight_version
+            logger.error("P2P weight update: engine %d marked errored: %r", self.engine_index, error)
+
+
+def _engine_call(engine: Any, method: str, *args, **kwargs) -> Any:
+    """Call a weight-sync method on a Ray actor handle or a plain (test) object."""
+    fn = getattr(engine, method)
+    if hasattr(fn, "remote"):
+        import ray
+
+        return ray.get(fn.remote(*args, **kwargs))
+    return fn(*args, **kwargs)
+
+
+def _sha256(tensor: torch.Tensor) -> str:
+    return hashlib.sha256(tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+
+
+class UpdateWeightFromP2P:
+    """Update disaggregated vLLM engines by RDMA-writing into their staging buffers."""
+
+    def __init__(
+        self,
+        args: Namespace,
+        model: Sequence[torch.nn.Module],
+        weights_getter: Callable[[], Mapping[str, torch.Tensor]],
+        *,
+        model_name: str,
+        quantization_config: dict[str, Any] | None,
+        # dependency injection for CPU tests (no Megatron / Mooncake / Ray)
+        iterator: Any | None = None,
+        transport: MooncakeTransport | None = None,
+        data_replica_rank_and_size: tuple[int, int] | None = None,
+    ) -> None:
+        self.args = args
+        self.weight_version = 0
+        self.update_weight_metrics: dict[str, float] = {}
+        if iterator is None:
+            from .hf_weight_iterator_direct import HfWeightIteratorDirect
+
+            iterator = HfWeightIteratorDirect(
+                args=args, model=model, model_name=model_name, quantization_config=quantization_config
+            )
+        self._iterator = iterator
+        self._weights_getter = weights_getter
+        self._transport = transport  # lazy: created on first connect with real engines
+        self._data_replica_rank_and_size = data_replica_rank_and_size
+        self._buffers: TransferBuffers | None = None
+        self._assignments = []
+        self._shards_by_rank: dict[int, list[RemoteShard]] = {}
+        self._targets: list[_EngineTarget] = []
+        self.rollout_engines: list[Any] = []
+
+    # ---- wiring -----------------------------------------------------------------
+
+    def _rank_and_size(self) -> tuple[int, int]:
+        if self._data_replica_rank_and_size is not None:
+            return self._data_replica_rank_and_size
+        try:
+            from megatron.core import mpu
+
+            return mpu.get_data_parallel_rank(), mpu.get_data_parallel_world_size()
+        except ImportError:
+            if dist.is_initialized():
+                return dist.get_rank(), dist.get_world_size()
+            return 0, 1
+
+    def _driver_rank(self) -> int:
+        return dist.get_rank() if dist.is_initialized() else 0
+
+    def connect_rollout_engines(
+        self,
+        rollout_engines: Sequence[Any],
+        rollout_engine_lock: Any,
+        engine_gpu_counts: Sequence[int] | None = None,
+        engine_gpu_offsets: Sequence[int] | None = None,
+        engine_parallel_configs: Sequence[Mapping[str, object]] | None = None,
+    ) -> None:
+        del rollout_engine_lock, engine_gpu_offsets
+        self.rollout_engines = list(rollout_engines)
+        engine_gpu_counts = list(
+            engine_gpu_counts or [self.args.rollout_num_gpus_per_engine] * len(self.rollout_engines)
+        )
+        self._targets = [_EngineTarget(i) for i in range(len(self.rollout_engines))]
+
+        # The engines resharding with their own loaders absorb any per-engine
+        # layout differences, so one HF bucket serves every layout.
+        if engine_parallel_configs is not None:
+            logger.info("p2p weight update: engines reshard staged buckets with their own loaders")
+
+        # One staging slot per worker: the per-engine write thread serializes
+        # write -> load, so a second slot is never used.
+        staging_nbytes = self.args.update_weight_buffer_size
+        if self._driver_rank() == 0:
+            for engine in self.rollout_engines:
+                _engine_call(
+                    engine,
+                    "init_weight_transfer_engine",
+                    {"init_info": {"staging_buffer_size_bytes": staging_nbytes}},
+                )
+        _gloo_barrier()
+
+        rank, size = self._rank_and_size()
+        self._assignments = assign_rollout_engine_ranks_for_data_replica(rank, size, engine_gpu_counts)
+        if not self._assignments:
+            return  # this trainer rank sends nothing
+
+        if self._transport is None:
+            self._transport = MooncakeTransport()
+
+        def query_transfer_info(engine_ind: int, engine_rank: int) -> dict | None:
+            target = self._targets[engine_ind]
+            if target.is_errored:
+                return None
+            # collective_rpc fans out to every worker of the engine; index by rank.
+            # Non-node-0 actors answer [] (they serve no HTTP): skip them.
+            infos = _engine_call(self.rollout_engines[engine_ind], "get_p2p_transfer_info")
+            if not infos or engine_rank >= len(infos):
+                return None
+            return infos[engine_rank]
+
+        engine_cell_ids = [f"engine-{i}" for i in range(len(self.rollout_engines))]
+        self._shards_by_rank = self._transport.connect(
+            query_transfer_info, engine_cell_ids, self._assignments
+        )
+        self._buffers = TransferBuffers(
+            2,  # double-buffered: pack the next bucket while the previous writes
+
+            self.args.update_weight_buffer_size,
+            device=self._transport.transfer_buffer_device,
+            register_memory=self._transport.register_memory,
+            unregister_memory=self._transport.unregister_memory,
+            write_timeout=self.args.p2p_transfer_timeout,
+        )
+
+    def disconnect_rollout_engines(self) -> None:
+        if self._buffers is not None:
+            self._buffers.release()
+            self._buffers = None
+        if self._transport is not None:
+            self._transport.close()
+        if self.rollout_engines and self._driver_rank() == 0:
+            for engine in self.rollout_engines:
+                _engine_call(engine, "destroy_weights_update_group", None)
+
+    def pop_metrics(self) -> dict[str, float]:
+        metrics, self.update_weight_metrics = self.update_weight_metrics, {}
+        return metrics
+
+    # ---- update -------------------------------------------------------------------
+
+    @torch.no_grad()
+    def update_weights(self) -> None:
+        self.weight_version += 1
+        flush_cache = should_flush_cache(
+            self.args.flush_cache_interval, self.weight_version, getattr(self.args, "update_weight_start_version", 0)
+        )
+
+        if self._driver_rank() == 0:
+            healthy = [e for e, t in zip(self.rollout_engines, self._targets) if not t.is_errored]
+            for engine in healthy:
+                _engine_call(engine, "pause_generation", mode="abort" if flush_cache else "in_place")
+            if flush_cache:
+                for engine in healthy:
+                    _engine_call(engine, "flush_cache")
+            for engine in healthy:
+                _engine_call(engine, "start_weight_update")
+        _gloo_barrier()
+
+        for bucket in self._iterator.get_hf_weight_chunks(self._weights_getter()):
+            self._send_bucket(dict(bucket))
+        if self._buffers is not None:
+            self._buffers.wait_for_all_writes()
+        _gloo_barrier()
+
+        if self._driver_rank() == 0:
+            for engine, target in zip(self.rollout_engines, self._targets):
+                if target.is_errored:
+                    continue
+                _engine_call(engine, "finish_weight_update", weight_version=str(self.weight_version))
+                _engine_call(engine, "continue_generation")
+        _gloo_barrier()
+
+        errored = [t for t in self._targets if t.errored_at_version == self.weight_version]
+        if errored and self._driver_rank() == 0:
+            # Retire errored engines: VLLMEngine.shutdown unregisters the worker
+            # from the router (traffic stops) and terminates the server process.
+            for target in errored:
+                try:
+                    _engine_call(self.rollout_engines[target.engine_index], "shutdown")
+                except Exception:
+                    logger.exception(
+                        "could not retire errored engine %d", target.engine_index
+                    )
+        if errored:
+            raise RuntimeError(
+                f"P2P weight update failed on engines {[t.engine_index for t in errored]}; "
+                "they were not resumed (weights may be partially written). "
+                f"First error: {errored[0].errored!r}"
+            )
+
+    def _send_bucket(self, bucket: dict[str, torch.Tensor]) -> None:
+        if self._buffers is None:
+            return
+        checksums = (
+            {name: _sha256(tensor) for name, tensor in bucket.items()}
+            if self.args.check_weight_transfer_checksum
+            else None
+        )
+        shards = [
+            shard
+            for assignment in self._assignments
+            for shard in self._shards_by_rank.get(assignment.rollout_engine_rank, [])
+            if not self._targets[shard.rollout_engine_ind].is_errored
+        ]
+        if not shards:
+            return
+        buffer = self._buffers.acquire()
+        # The bucket bytes are identical for every target (engines reshard with
+        # their own loaders), so pack once and fan the writes out.
+        manifest = pack_bucket_into_transfer_buffer(buffer, bucket)
+        for entry in manifest:
+            tensor = bucket[entry["name"]]
+            entry["dtype"] = str(tensor.dtype).split(".")[-1]
+            entry["shape"] = list(tensor.shape)
+        total_nbytes = manifest[-1]["offset"] + manifest[-1]["nbytes"] if manifest else 0
+        # run_write executes inside the transport's per-engine write thread, so
+        # the load RPC is issued strictly after THIS engine's RDMA write landed.
+        pending = self._transport.write(
+            shards,
+            buffer,
+            total_nbytes,
+            run_write=lambda shard, write, m=manifest: self._run_write_then_load(
+                shard, write, m, checksums
+            ),
+        )
+        self._buffers.release_after(
+            buffer,
+            [
+                self._pending_write(future, shard)
+                for future, shard in zip(pending, shards, strict=True)
+            ],
+        )
+
+    def _pending_write(self, future, shard: RemoteShard):
+        from .p2p import PendingWrite
+
+        return PendingWrite(future=future, target=self._targets[shard.rollout_engine_ind])
+
+    def _run_write_then_load(
+        self,
+        shard: RemoteShard,
+        write: Callable[[], None],
+        manifest: list[dict],
+        checksums: dict[str, str] | None,
+    ) -> None:
+        target = self._targets[shard.rollout_engine_ind]
+        try:
+            write()
+            self._load_on_engine(shard, manifest, checksums)
+        except Exception as error:
+            target.mark_errored(error, self.weight_version)
+            raise
+
+    def _load_on_engine(
+        self, shard: RemoteShard, manifest: list[dict], checksums: dict[str, str] | None
+    ) -> None:
+        target = self._targets[shard.rollout_engine_ind]
+        update_info = {
+            "manifest": manifest,
+            "checksums": checksums or {},
+            "target_rank": shard.rollout_engine_rank,
+        }
+        received = _engine_call(
+            self.rollout_engines[shard.rollout_engine_ind], "load_weights_from_staged", update_info
+        )
+        if isinstance(received, list):
+            if not received:
+                return  # non-node-0 actor: no HTTP, nothing to verify
+            received = received[shard.rollout_engine_rank]
+        if checksums is not None and received != checksums:
+            raise RuntimeError(
+                f"engine {shard.rollout_engine_ind} rank {shard.rollout_engine_rank} returned "
+                "checksums that differ from the sender's"
+            )
+
+
+def _gloo_barrier() -> None:
+    if dist.is_initialized():
+        dist.barrier(group=get_gloo_group())
