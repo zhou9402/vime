@@ -1,3 +1,5 @@
+# NOTE: kept for slime-mirror compatibility; the canonical copy now lives at
+# vime/kernels/quant/fp8_blockwise.py (entry point `fp8_blockwise_cast`). Do not add new features here.
 import torch
 import triton
 import triton.language as tl
