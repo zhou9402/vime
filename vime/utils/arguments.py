@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from vime.agent.arguments import add_agent_arguments
 from vime.backends.vllm_utils.arguments import validate_args as vllm_validate_args
 from vime.backends.vllm_utils.arguments import vllm_parse_args
 from vime.backends.vllm_utils.external import apply_external_engine_info_to_args
@@ -1795,6 +1796,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_dspark_training_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_agent_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",

@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from vime.agent.agent_function import call_agent_function
 from vime.backends.vllm_utils.server_control import abort_servers_until_idle, get_live_router_workers
 from vime.data.transport import discard_rollout_group, inherit_queue_context, publish_rollout_async
 from vime.observability.trace_utils import build_vllm_meta_trace_attrs, trace_function, trace_span
@@ -388,6 +389,32 @@ def _align_mm_feature_placeholders_to_tokens(generate_body: dict[str, Any], toke
         search_start = offset + len(placeholder_tokens)
 
 
+def _build_generate_call(args, sample, sampling_params, *, evaluation: bool, generate):
+    """Build the coroutine generating one sample, plus the function whose ``abort_mode`` applies.
+
+    ``--custom-generate-function-path`` (or ``sample.generate_function_path``) runs in-process,
+    byte-identical to legacy behavior. Only ``--custom-agent-function-path`` goes through
+    ``call_agent_function``, isolated per ``--custom-agent-function-mode``.
+    """
+    agent_func_path = getattr(args, "custom_agent_function_path", None)
+    if agent_func_path is not None:
+        agent_func = load_function(agent_func_path)
+        call_kwargs = {"args": args, "sample": sample, "sampling_params": sampling_params}
+        if "evaluation" in inspect.signature(agent_func).parameters:
+            call_kwargs["evaluation"] = evaluation
+        return (
+            call_agent_function(agent_func, mode=args.custom_agent_function_mode, **call_kwargs),
+            agent_func,
+        )
+
+    custom_func_path = sample.generate_function_path or args.custom_generate_function_path
+    generate_func = load_function(custom_func_path) if custom_func_path is not None else generate
+
+    if custom_func_path is not None and "evaluation" in inspect.signature(generate_func).parameters:
+        return generate_func(args, sample, sampling_params, evaluation=evaluation), generate_func
+    return generate_func(args, sample, sampling_params), generate_func
+
+
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using vLLM router with token-based workflow"""
     if args.ci_test:
@@ -632,13 +659,9 @@ async def generate_and_rm(
             return sample
 
         with state.dp_rank_context() as _:
-            custom_func_path = sample.generate_function_path or args.custom_generate_function_path
-            generate_func = load_function(custom_func_path) if custom_func_path is not None else generate
-
-            if custom_func_path is not None and "evaluation" in inspect.signature(generate_func).parameters:
-                generate_call = generate_func(args, sample, sampling_params, evaluation=evaluation)
-            else:
-                generate_call = generate_func(args, sample, sampling_params)
+            generate_call, generate_func = _build_generate_call(
+                args, sample, sampling_params, evaluation=evaluation, generate=generate
+            )
 
             if getattr(generate_func, "abort_mode", None) == "request":
                 sample = await _run_request_abortable_generate(state, sample, generate_call)
