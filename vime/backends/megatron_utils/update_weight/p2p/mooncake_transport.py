@@ -135,6 +135,12 @@ class MooncakeTransport:
             shards_by_rank[assignment.rollout_engine_rank] = shards
         return shards_by_rank
 
+    @property
+    def has_uncertain_writes(self) -> bool:
+        """A write with unknown native completion happened; registered memory
+        can never be unregistered, so this transport can only be discarded."""
+        return self._has_uncertain_writes
+
     def register_memory(self, tensor: torch.Tensor) -> None:
         ret = self._transfer_engine.register_memory(tensor.data_ptr(), _nbytes(tensor))
         if ret != 0:

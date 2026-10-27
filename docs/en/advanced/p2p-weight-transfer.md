@@ -94,6 +94,18 @@ checksums of the staged bytes, then loads through the model's own
   then retired via the engine's existing shutdown path (router unregister +
   process kill) before the update raises.
 
+## Degraded mode (`--p2p-on-engine-error`)
+
+Default `fail`: any engine error during an update fails the run. `continue`
+(for disaggregated multi-engine deployments only; rejected for a single rollout
+engine) keeps training on the healthy fleet. Lifecycle of an errored engine:
+errored → shut down + skipped → the health monitor retires it → `recover()`
+replaces it → the next `connect_rollout_engines` clears the quarantine → the
+next update fully syncs it (P2P always sends full buckets). The update raises
+only if the healthy count drops below `--p2p-min-healthy-engines` (default 1),
+naming the errored engine indices and version. Fleet state is exported as
+`p2p/errored_engines` / `p2p/healthy_engines` metrics.
+
 ## Verifier
 
 `python -m pytest tests/test_p2p_weight_transfer.py -x -q` covers the contract

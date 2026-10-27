@@ -2431,10 +2431,12 @@ def vime_validate_args(args):
         if getattr(args, "lora_rank", 0) > 0:
             raise ValueError("LoRA weight sync is not supported for p2p (RDMA) weight transfer.")
         from vime.backends.megatron_utils.update_weight.p2p.arguments import (
+            validate_p2p_degrade_args,
             validate_p2p_spec_decode_args,
         )
 
         validate_p2p_spec_decode_args(args)
+        validate_p2p_degrade_args(args)
 
     # disk-backed sync (full or delta) writes on the trainer and reads on the engines: needs a shared dir
     if args.update_weight_transport == "disk" and not args.update_weight_disk_dir:

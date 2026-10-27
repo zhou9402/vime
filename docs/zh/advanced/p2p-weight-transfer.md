@@ -77,6 +77,15 @@ p2p 与 `--colocate`、LoRA、投机解码互斥(参数校验直接拒绝)。
 - 出错引擎在所有训练 rank 间做并集隔离(gloo all-gather),随后走引擎现有的
   shutdown 路径(router 注销 + 进程终止),更新随即报错。
 
+## 降级模式(`--p2p-on-engine-error`)
+
+默认 `fail`:任何引擎在更新中出错都会让本次运行失败。`continue`(仅用于多引擎的分离部署;
+单个 rollout 引擎时会被参数校验拒绝)让训练在健康引擎上继续。出错引擎的生命周期:出错 →
+shutdown + 跳过 → 健康检查将其退役 → `recover()` 重建 → 下一次 `connect_rollout_engines`
+解除隔离 → 下一次更新全量同步(P2P 总是发送全量桶)。仅当健康引擎数低于
+`--p2p-min-healthy-engines`(默认 1)时才报错,报错信息包含出错引擎编号与版本号。
+集群状态通过 `p2p/errored_engines` / `p2p/healthy_engines` 指标导出。
+
 ## Verifier
 
 `python -m pytest tests/test_p2p_weight_transfer.py -x -q` 用 fake 覆盖合约:

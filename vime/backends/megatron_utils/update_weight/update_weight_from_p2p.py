@@ -6,15 +6,15 @@ staging buffer each target engine worker publishes, and the worker reshards the
 staged bytes with its own vLLM `load_weights` (`load_weights_from_staged`).
 
 Only disaggregated (non-colocate) full-mode sync; argument validation rejects
-colocate / LoRA / speculative decoding. Writes are never retried: a failed
-write or checksum verification marks the engine errored (it is skipped for the
-rest of this and later updates), healthy engines finish the update, and the
-update raises at the end if any engine errored.
+colocate / LoRA, and dspark speculative decoding (mtp is supported). Writes are
+never retried. An engine that errors is shut down and skipped; the health
+monitor then retires it, `recover()` replaces it, the next
+`connect_rollout_engines` clears the quarantine, and the next update fully
+syncs it. --p2p-on-engine-error=fail raises at the end of the update; =continue
+keeps training on the healthy fleet down to --p2p-min-healthy-engines.
 """
 
-import hashlib
 import logging
-import socket
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -84,7 +84,7 @@ class UpdateWeightFromP2P:
         quantization_config: dict[str, Any] | None,
         # dependency injection for CPU tests (no Megatron / Mooncake / Ray)
         iterator: Any | None = None,
-        transport: MooncakeTransport | None = None,
+        transport_factory: Callable[[], MooncakeTransport] = MooncakeTransport,
         data_replica_rank_and_size: tuple[int, int] | None = None,
     ) -> None:
         self.args = args
@@ -98,7 +98,8 @@ class UpdateWeightFromP2P:
             )
         self._iterator = iterator
         self._weights_getter = weights_getter
-        self._transport = transport  # lazy: created on first connect with real engines
+        self._transport_factory = transport_factory
+        self._transport: MooncakeTransport | None = None  # created on connect
         self._data_replica_rank_and_size = data_replica_rank_and_size
         self._buffers: TransferBuffers | None = None
         self._assignments = []
@@ -132,6 +133,9 @@ class UpdateWeightFromP2P:
         engine_parallel_configs: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         del rollout_engine_lock, engine_gpu_offsets
+        # Reconnect (an engine recovered after being retired) starts from a clean
+        # slate — same as the distributed path.
+        self.disconnect_rollout_engines()
         self.rollout_engines = list(rollout_engines)
         engine_gpu_counts = list(
             engine_gpu_counts or [self.args.rollout_num_gpus_per_engine] * len(self.rollout_engines)
@@ -161,7 +165,7 @@ class UpdateWeightFromP2P:
             return  # this trainer rank sends nothing
 
         if self._transport is None:
-            self._transport = MooncakeTransport()
+            self._transport = self._transport_factory()
 
         def query_transfer_info(engine_ind: int, engine_rank: int) -> dict | None:
             target = self._targets[engine_ind]
@@ -201,14 +205,36 @@ class UpdateWeightFromP2P:
         )
 
     def disconnect_rollout_engines(self) -> None:
+        """Tear down the current fleet connection. Idempotent.
+
+        A transport with uncertain writes can never unregister its memory, so
+        its pinned buffers are abandoned (logged) rather than released; the
+        transport itself is always closed (per-engine write threads) and dropped.
+        """
         if self._buffers is not None:
-            self._buffers.release()
+            if self._transport is not None and self._transport.has_uncertain_writes:
+                logger.warning(
+                    "P2P transport has writes with unknown completion; abandoning "
+                    "its pinned transfer buffers (they cannot be unregistered)"
+                )
+            else:
+                self._buffers.release()
             self._buffers = None
         if self._transport is not None:
             self._transport.close()
+            self._transport = None
         if self.rollout_engines and self._driver_rank() == 0:
-            for engine in self.rollout_engines:
-                _engine_call(engine, "destroy_weights_update_group", None)
+            for engine, target in zip(self.rollout_engines, self._targets, strict=True):
+                if target.is_errored:
+                    continue  # already shut down when it errored
+                try:
+                    _engine_call(engine, "destroy_weights_update_group", None)
+                except Exception:
+                    # Errored engines may be dead Ray actors by the time recover()
+                    # reconnects; a stale engine's teardown must never block it.
+                    logger.warning(
+                        "could not tear down weight transfer on engine %d", target.engine_index, exc_info=True
+                    )
 
     def pop_metrics(self) -> dict[str, float]:
         metrics, self.update_weight_metrics = self.update_weight_metrics, {}
@@ -245,21 +271,42 @@ class UpdateWeightFromP2P:
 
         errored = [t for t in self._targets if t.errored_at_version == self.weight_version]
         if errored and self._driver_rank() == 0:
-            # Retire errored engines: VLLMEngine.shutdown unregisters the worker
-            # from the router (traffic stops) and terminates the server process.
+            # Retire errored engines BEFORE the fail/continue decision so a
+            # retired engine never serves stale weights: VLLMEngine.shutdown
+            # unregisters the worker from the router and kills the server.
             for target in errored:
                 try:
                     _engine_call(self.rollout_engines[target.engine_index], "shutdown")
                 except Exception:
-                    logger.exception(
-                        "could not retire errored engine %d", target.engine_index
-                    )
-        if errored:
-            raise RuntimeError(
-                f"P2P weight update failed on engines {[t.engine_index for t in errored]}; "
-                "they were not resumed (weights may be partially written). "
-                f"First error: {errored[0].errored!r}"
+                    logger.exception("could not retire errored engine %d", target.engine_index)
+        healthy = [t for t in self._targets if not t.is_errored]
+        self.update_weight_metrics["p2p/errored_engines"] = sum(t.is_errored for t in self._targets)
+        self.update_weight_metrics["p2p/healthy_engines"] = len(healthy)
+        if not errored:
+            return
+        if self.args.p2p_on_engine_error == "continue":
+            # The errored engine stays quarantined until the health monitor
+            # retires it and recover() replaces + reconnects it; healthy engines
+            # keep serving. Only dropping below the healthy floor fails.
+            indices = [t.engine_index for t in errored]
+            if len(healthy) < self.args.p2p_min_healthy_engines:
+                raise RuntimeError(
+                    f"P2P weight update: engines {indices} errored at version {self.weight_version}; "
+                    f"healthy {len(healthy)} < --p2p-min-healthy-engines "
+                    f"{self.args.p2p_min_healthy_engines}"
+                )
+            logger.warning(
+                "P2P weight update: engines %s errored at version %d; continuing with %d healthy engines",
+                indices,
+                self.weight_version,
+                len(healthy),
             )
+            return
+        raise RuntimeError(
+            f"P2P weight update failed on engines {[t.engine_index for t in errored]}; "
+            "they were not resumed (weights may be partially written). "
+            f"First error: {errored[0].errored!r}"
+        )
 
     def _mtp_draft_enabled(self) -> bool:
         """Same trigger as the distributed path's draft pass (mtp only; dspark is
@@ -270,7 +317,7 @@ class UpdateWeightFromP2P:
         )
 
     def _healthy_engines(self) -> list:
-        return [e for e, t in zip(self.rollout_engines, self._targets) if not t.is_errored]
+        return [e for e, t in zip(self.rollout_engines, self._targets, strict=True) if not t.is_errored]
 
     def _run_session(self, start_method: str) -> None:
         """One weight-update session: start -> all buckets -> finish(version).
@@ -286,7 +333,7 @@ class UpdateWeightFromP2P:
         engine without draft support) is not transient: the engine is quarantined.
         """
         if self._driver_rank() == 0:
-            for engine, target in zip(self.rollout_engines, self._targets):
+            for engine, target in zip(self.rollout_engines, self._targets, strict=True):
                 if target.is_errored:
                     continue
                 try:
@@ -304,7 +351,7 @@ class UpdateWeightFromP2P:
         _gloo_barrier()
 
         if self._driver_rank() == 0:
-            for engine, target in zip(self.rollout_engines, self._targets):
+            for engine, target in zip(self.rollout_engines, self._targets, strict=True):
                 if target.is_errored:
                     continue
                 _engine_call(engine, "finish_weight_update", weight_version=str(self.weight_version))
@@ -376,7 +423,6 @@ class UpdateWeightFromP2P:
     def _load_on_engine(
         self, shard: RemoteShard, manifest: list[dict], checksums: dict[str, str] | None
     ) -> None:
-        target = self._targets[shard.rollout_engine_ind]
         update_info = {
             "manifest": manifest,
             "checksums": checksums or {},

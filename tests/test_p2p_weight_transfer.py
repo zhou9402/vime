@@ -37,6 +37,7 @@ class FakeTransferEngine:
         self.fail_sessions: set[str] | None = None
         self.corrupt_sessions: set[str] = set()
         self.corrupt_after: dict[str, int] = {}
+        self.unregistered: list[int] = []
         self._writes_by_session: dict[str, int] = {}
         self.writes = 0
 
@@ -45,6 +46,7 @@ class FakeTransferEngine:
         return 0
 
     def unregister_memory(self, ptr: int) -> int:
+        self.unregistered.append(ptr)
         del self.registered[ptr]
         return 0
 
@@ -185,7 +187,10 @@ class FakeEngine:
         self.resumed = True
 
     def destroy_weights_update_group(self, _group):
-        pass
+        if self.shutdown_called:
+            # a retired engine is a dead Ray actor by the time recover() reconnects
+            raise RuntimeError("actor is dead")
+        self.events.append(("destroy",))
 
     def shutdown(self):
         # VLLMEngine.shutdown: unregister from the router + kill the server.
@@ -241,7 +246,7 @@ def _make_updater(weights, engines, fake_transfer_engine, *, checksum=True, buff
         model_name="tiny",
         quantization_config=None,
         iterator=_FakeIterator([weights]),
-        transport=MooncakeTransport(transfer_engine=fake_transfer_engine),
+        transport_factory=lambda: MooncakeTransport(transfer_engine=fake_transfer_engine),
         data_replica_rank_and_size=replicas,
     )
     updater.connect_rollout_engines(engines, None, engine_gpu_counts=[len(e.ranks) for e in engines])
@@ -391,7 +396,7 @@ def test_transient_control_plane_error_is_retried():
         assert torch.equal(engines[0].ranks[0][name], tensor), name
 
 
-def test_quarantine_union_marks_engines_errored_on_other_ranks():
+def test_quarantine_union_marks_engines_errored_on_other_ranks(monkeypatch):
     """An engine that errored on any trainer rank is quarantined on all of them."""
     from vime.backends.megatron_utils.update_weight.update_weight_from_p2p import (
         _EngineTarget,
@@ -401,12 +406,8 @@ def test_quarantine_union_marks_engines_errored_on_other_ranks():
 
     targets = [_EngineTarget(0), _EngineTarget(1)]
     targets[0].mark_errored(RuntimeError("boom"), weight_version=3)
-    p2p_updater._union_over_gloo_orig = getattr(p2p_updater, "_union_over_gloo")
-    try:
-        p2p_updater._union_over_gloo = lambda local: local | {1}
-        _quarantine_errored_engines(targets, weight_version=3)
-    finally:
-        p2p_updater._union_over_gloo = p2p_updater._union_over_gloo_orig
+    monkeypatch.setattr(p2p_updater, "_union_over_gloo", lambda local: local | {1})
+    _quarantine_errored_engines(targets, weight_version=3)
     assert targets[1].is_errored
     assert targets[1].errored_at_version == 3
 
@@ -415,7 +416,6 @@ def test_quarantine_union_marks_engines_errored_on_other_ranks():
 # F01-P6 verifier (xfail until the P6a/P6b implementation lands)
 # =============================================================================
 
-_P6B = pytest.mark.xfail(strict=True, reason="F01-P6b not implemented")
 
 _MTP_ARGS = dict(enable_mtp_training=True, vllm_speculative_config={"method": "mtp"})
 
@@ -554,7 +554,6 @@ def test_p6a_validation_accepts_mtp_and_rejects_dspark():
 # --- P6b: degrade instead of raise ----------------------------------------------
 
 
-@_P6B
 def test_p6b_continue_mode_quarantines_and_finishes_versions():
     """3 engines, engine 1 fails at v1, mode=continue: no raise; engines 0/2
     finish v1; engine 1 shut down exactly once; v2 skips engine 1 entirely."""
@@ -580,7 +579,6 @@ def test_p6b_continue_mode_quarantines_and_finishes_versions():
     assert engines[1].shutdown_calls == 1, "shutdown exactly once"
 
 
-@_P6B
 def test_p6b_continue_mode_raises_below_min_healthy():
     """2 of 3 engines fail with min_healthy=2 -> raise naming both indices + version."""
     weights = _source_weights()
@@ -612,7 +610,6 @@ def test_p6b_fail_mode_still_raises():
     assert engines[1].resumed
 
 
-@_P6B
 def test_p6b_continue_quarantine_is_union_across_trainer_ranks(monkeypatch):
     """Engine 0's error is only 'seen on another rank' (mocked gloo union): under
     continue mode it is still quarantined and skipped at v2, without raising."""
@@ -631,7 +628,6 @@ def test_p6b_continue_quarantine_is_union_across_trainer_ranks(monkeypatch):
     assert engines[1].weight_version == "2"
 
 
-@_P6B
 def test_p6b_continue_with_single_engine_rejected_at_validation():
     """continue with one engine is meaningless (min_healthy=1 can never hold):
     rejected at argument validation."""
@@ -647,3 +643,72 @@ def test_p6b_continue_with_single_engine_rejected_at_validation():
         validate(single)
     fail_mode = SimpleNamespace(p2p_on_engine_error="fail", p2p_min_healthy_engines=1, rollout_num_engines=1)
     validate(fail_mode)  # fail mode with one engine is fine
+    # bounds: 1 <= min_healthy <= fleet size, in both modes
+    for mode in ("fail", "continue"):
+        with pytest.raises(ValueError, match="p2p-min-healthy-engines"):
+            validate(SimpleNamespace(p2p_on_engine_error=mode, p2p_min_healthy_engines=0, rollout_num_engines=3))
+        with pytest.raises(ValueError, match="p2p-min-healthy-engines"):
+            validate(SimpleNamespace(p2p_on_engine_error=mode, p2p_min_healthy_engines=4, rollout_num_engines=3))
+
+
+def test_p6b_reconnect_after_recovery_lifts_quarantine():
+    """The FT lifecycle: errored -> shut down + skipped -> recover() replaces ->
+    reconnect clears the quarantine -> next update fully syncs the replacement."""
+    weights = _source_weights()
+    engines = [FakeEngine(weights) for _ in range(3)]
+    transfer_engine = FakeTransferEngine()
+    updater = _make_updater(
+        weights, engines, transfer_engine, p2p_on_engine_error="continue", p2p_min_healthy_engines=1
+    )
+    transfer_engine.fail_with = -1
+    transfer_engine.fail_sessions = {engines[1].get_p2p_transfer_info()[0]["session_id"]}
+    updater.update_weights()  # v1: engine 1 errored, no raise
+    assert engines[1].shutdown_calls == 1
+
+    # health monitor retired it; recover() replaces it and the actor reconnects
+    new_engine1 = FakeEngine(weights)
+    old_events = list(engines[1].events)
+    transfer_engine.fail_with = None
+    updater.connect_rollout_engines([engines[0], new_engine1, engines[2]], None, engine_gpu_counts=[1, 1, 1])
+    updater.update_weights()
+
+    assert [e.weight_version for e in (engines[0], new_engine1, engines[2])] == ["2", "2", "2"]
+    for name, tensor in weights.items():
+        assert torch.equal(new_engine1.ranks[0][name], tensor), name
+    assert engines[1].events == old_events, "the dead engine gets no further calls"
+    assert engines[0].events.count(("destroy",)) == 1, "healthy engines torn down once at reconnect"
+    assert engines[2].events.count(("destroy",)) == 1
+    metrics = updater.pop_metrics()
+    assert metrics["p2p/errored_engines"] == 0
+    assert metrics["p2p/healthy_engines"] == 3
+
+
+def test_p6b_poisoned_transport_is_rebuilt_on_reconnect():
+    """A transport with uncertain writes can never unregister: reconnect closes it
+    (write threads) without release() and rebuilds a fresh one over the same fabric."""
+    weights = _source_weights()
+    engines = [FakeEngine(weights), FakeEngine(weights)]
+    fake = FakeTransferEngine()
+    updater = _make_updater(weights, engines, fake, p2p_on_engine_error="continue")
+    fake.fail_with = -1
+    fake.fail_sessions = {engines[0].get_p2p_transfer_info()[0]["session_id"]}
+    updater.update_weights()  # engine 0 errors; the write's completion is uncertain
+
+    old_transport = updater._transport
+    old_buffers = updater._buffers
+    assert old_transport.has_uncertain_writes
+    closed = []
+    released = []
+    old_transport.close = lambda: closed.append(True)
+    old_buffers.release = lambda: released.append(True)
+    old_buffer_ptrs = {b.data_ptr() for b in old_buffers._buffers}
+
+    updater.connect_rollout_engines(engines, None, engine_gpu_counts=[1, 1])
+
+    assert updater._transport is not old_transport, "poisoned transport must be rebuilt"
+    assert closed == [True], "old transport's write executors must be shut down"
+    assert not released, "release() cannot unregister a poisoned transport"
+    assert not old_buffer_ptrs & set(fake.unregistered), "old buffers must never be unregistered"
+    assert old_buffer_ptrs <= set(fake.registered), "old registrations stay (leaked with the transport)"
+    updater.update_weights()  # v2 proceeds on the healthy engine with the new transport
+    assert engines[1].weight_version == "2"
