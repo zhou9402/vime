@@ -102,3 +102,8 @@ python tools/trace_timeline_viewer.py /path/to/debug/rollout_0.pt
 git 状态（commit + dirty hash）。argv 和环境变量中的密钥会被哈希脱敏（`redacted-sha256:<16 hex>`）。
 参数：`--env-report`（launcher JSON 记录路径，默认 `$VIME_SCRIPT_ENV_REPORT`）和
 `--env-report-interval-seconds`（默认 3600；非正数表示只在启动时报告一次）。
+
+## 周期性 py-spy dump
+
+设置 `VIME_DEBUG_PYSPY_DUMP_INTERVAL=<秒数>` 后，后台线程会周期性地对节点上所有 python/ray/vLLM
+进程执行 `py-spy dump` 并把堆栈打印到 stdout。默认关闭；需要 PATH 上有 `py-spy`。

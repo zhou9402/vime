@@ -105,3 +105,9 @@ vars, pip packages, and git state (commit + dirty hash) of editable installs. Se
 env vars are hash-redacted (`redacted-sha256:<16 hex>`). Flags: `--env-report` (launcher JSON
 record path, default `$VIME_SCRIPT_ENV_REPORT`) and `--env-report-interval-seconds` (default
 3600; non-positive = report once at startup).
+
+## Periodic py-spy dump
+
+Set `VIME_DEBUG_PYSPY_DUMP_INTERVAL=<seconds>` to start a background thread that periodically runs
+`py-spy dump` on every python/ray/vLLM process on the node and prints stacks to stdout. Off by
+default; requires `py-spy` on PATH.

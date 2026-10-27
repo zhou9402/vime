@@ -5,6 +5,7 @@ import ray
 from vime.data.checkpoint import save_checkpoint
 from vime.observability.env_report import start_env_reporting
 from vime.observability.logging_utils import configure_logger, finish_tracking, init_tracking
+from vime.observability.periodic_py_spy import maybe_start_periodic_pyspy_dump
 from vime.ray.placement_group import create_rollout_manager, create_training_models
 from vime.utils.arguments import parse_args
 from vime.utils.cleanup import Cleanup
@@ -132,4 +133,5 @@ if __name__ == "__main__":
     args, restore_plan = parse_args(return_restore_plan=True)
     configure_logger()
     start_env_reporting(args)
+    maybe_start_periodic_pyspy_dump()
     main(args, restore_plan)
