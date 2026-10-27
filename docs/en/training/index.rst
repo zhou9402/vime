@@ -16,3 +16,4 @@ Understand policy objectives, precision, parallelism, and memory.
    ../advanced/model-converter-harness.md
    ../advanced/mbridge-load-mode.md
    ../advanced/dsa-kernels.md
+   ../advanced/day0-models.md
