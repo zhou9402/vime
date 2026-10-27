@@ -34,8 +34,8 @@ class InklingLMHeadSpec:
 
 
 def _read_unpadded_vocab_size(hf_checkpoint: str) -> int | None:
-    """SGLang serves Inkling's lm_head over ``unpadded_vocab_size`` when the config declares one
-    (sglang configs/inkling.py); None keeps every row."""
+    """The serving engine serves Inkling's lm_head over ``unpadded_vocab_size`` when the config
+    declares one; None keeps every row."""
     with open(os.path.join(hf_checkpoint, "config.json"), encoding="utf-8") as handle:
         config = json.load(handle)
     return config.get("text_config", config).get("unpadded_vocab_size")

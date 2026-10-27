@@ -106,7 +106,7 @@ _HF_LAYER = r"(?:^|\.)layers\.(?:\d+|\*)\."
 class FixedTargets:
     """A verified adapter layout: requests must be the model's HF target layout, minus ``optional`` suffixes.
 
-    ``serving`` turns the request into SGLang's target list. ``select_all`` attaches every
+    ``serving`` turns the request into the serving engine's target list. ``select_all`` attaches every
     implemented projection regardless of names, for specs whose export names are not HF targets.
     """
 

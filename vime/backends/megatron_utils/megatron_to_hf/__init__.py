@@ -68,3 +68,8 @@ def _convert_to_hf_core(args, model_name, name, param):
         raise ValueError(f"Unsupported model: {model_name}")
 
     return converted_named_tensors
+
+
+def converter_model_name(args, hf_config) -> str:
+    """The model name the converters dispatch on."""
+    return type(hf_config).__name__.lower() if getattr(args, "model_name", None) is None else args.model_name

@@ -49,7 +49,7 @@ def _replicated_guard(host: nn.Module, _context: AttachContext, projection: Proj
     assert _is_replicated_linear(host, full_out), (
         f"native MLA LoRA expects a replicated {projection.hf_leaf} (TELinear parallel_mode='duplicated'); "
         f"this build shards it ({tuple(host.weight.shape)} vs full out {full_out}). "
-        "Use --megatron-to-hf-mode bridge for this variant."
+        "This sharded variant is not supported by native LoRA in vime."
     )
 
 
@@ -89,10 +89,10 @@ class GQAAttentionSpec(AttentionSpecBase):
             config, "num_query_groups", None
         )  # config-access-exempt: architecture configs without query groups represent ordinary multi-head attention
         assert num_query_groups is None or num_query_groups >= tp_size, (
-            "native LoRA (--megatron-to-hf-mode raw) does not support this architecture: "
+            "native LoRA does not support this architecture: "
             f"num_query_groups ({num_query_groups}) < tensor parallel size ({tp_size}), so mcore splits a "
             "single query group across ranks and the local qkv rows are not a per-group slice. "
-            "Use --megatron-to-hf-mode bridge."
+            "This configuration is not supported by native LoRA in vime."
         )
 
 
@@ -152,8 +152,8 @@ class MLAAttentionSpec(AttentionSpecBase):
         ), (  # config-access-exempt: only MLA architecture configs declare q_lora_rank
             "native LoRA does not support multi-latent attention without q_lora_rank "
             "(DeepSeek-V2-Lite, Moonlight): the query path is uncompressed, so the adapter exports "
-            "an unfused q_proj alongside kv_a_proj_with_mqa, and SGLang's loader expects the fused "
-            "qkv_a layout. Use --megatron-to-hf-mode bridge."
+            "an unfused q_proj alongside kv_a_proj_with_mqa, and the serving loader expects the fused "
+            "qkv_a layout, which native LoRA in vime does not support."
         )
 
 
@@ -314,7 +314,7 @@ class InklingAttentionSpec(AttentionSpecBase):
     """GQA-with-relative-projection: fused [q;k;v;r], plain concat (no group permute).
 
     Exports carry Inkling's TML names (``attn.wq_du/wk_dv/wv_dv/wr_du/wo_ud``),
-    which SGLang auto-detects, so serving passes ``lora_target_modules=["all"]``.
+    which the serving engine auto-detects, so serving passes ``lora_target_modules=["all"]``.
     """
 
     name = "inkling"

@@ -19,3 +19,5 @@ vime 正在从 miles 移植 LoRA 支持（`miles@ba28991834`，移植编号 F04�
 - **F04-3c**：架构 spec——`native/spec/{attention,mlp,lm_head}.py`（GQA/带门控 GQA/MLA 注意力布局、split+fused gate/up MLP）与 `native/merge.py`（用于全量 HF 导出的 `MergedWeights` 视图）。测试：`test_specs.py`（裸模块挂接、零初始化等价、梯度流、target 选择、合并 delta）。
 
 - **F04-3d**：MoE adapter——`native/modules/moe.py`（`LoRAGroupedFC1/FC2`、shared-experts adapter）与 `native/spec/moe.py`；移植 miles 的 `test_merge.py`（合并权重 delta 必须复现前向 delta，含 MLA 与分组 experts）。rollout 侧 expert LoRA 仍由 F04-2 的校验关闭。
+
+- **F04-3e**：注册表与入口——`native/registry.py`（`MODEL_SPECS`、`resolve_adapter_targets`、`validate_native_lora_args`、`preflight_native_lora`）、`native/lora.py`（`apply_native_lora`、`wrap_model_provider_with_lora`）、包导出与 `megatron_to_hf.converter_model_name` 桥接。测试：`test_registry.py`（架构守卫、target 契约、attach 遍历、运行配置校验）。

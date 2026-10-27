@@ -68,7 +68,7 @@ class ConverterNaming:
 
 class DeclaredNaming:
     """Adapters named by a fixed table, for architectures whose served adapter names are not
-    the HF checkpoint names the converter produces (Inkling: SGLang's module names).
+    the HF checkpoint names the converter produces (Inkling: the serving engine's module names).
 
     ``hf_blocks_by_param_prefix`` maps a host's parameter name inside its layer, by prefix, to its HF block.
     """

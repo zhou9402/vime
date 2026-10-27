@@ -21,7 +21,7 @@ def export_lora_hf_named(model_chunks) -> list[tuple[str, torch.Tensor]]:
     """Materialize full HF/PEFT adapter tensors on every TP rank.
 
     This representation preserves the exact target set; the serving exporter adds the
-    zero siblings SGLang's fused buffers need. The weight iterator gathers across PP.
+    zero siblings the serving engine's fused buffers need. The weight iterator gathers across PP.
     """
     started = time.perf_counter()
     gather = ParallelGather()
