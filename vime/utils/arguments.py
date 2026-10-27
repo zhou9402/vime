@@ -1828,6 +1828,19 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_multi_policy_arguments(parser):
+            parser.add_argument(
+                "--multi-policy-config",
+                type=str,
+                default=None,
+                help=(
+                    "Path to the multi-policy trainer YAML config (or a base64: payload) declaring one "
+                    "entry per policy: trainers: [{model_id, role, trainer_id, overrides}]. Absent means a "
+                    "single-policy run. See vime/utils/multi_policy/megatron_config.py."
+                ),
+            )
+            return parser
+
         # Add custom arguments in front to prevent overwritten some vime arguments.
         if add_custom_arguments is not None:
             parser = add_custom_arguments(parser)
@@ -1849,6 +1862,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
         parser = add_dspark_training_arguments(parser)
+        parser = add_multi_policy_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         reset_arg(
@@ -2466,6 +2480,10 @@ def vime_validate_args(args):
         args.eval_function_path = args.rollout_function_path
 
     from vime.ray.training_recovery import configure_recovery_checkpoint, training_recovery_enabled
+
+    from vime.utils.multi_policy.megatron_config import validate_multi_policy_flags
+
+    validate_multi_policy_flags(args)
 
     if training_recovery_enabled(args):
         configure_recovery_checkpoint(args)

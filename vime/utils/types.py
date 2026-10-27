@@ -117,6 +117,10 @@ class Sample:
     # sibling, so loss aggregation averages within the rollout instead of
     # over-counting it.
     rollout_id: int | None = None
+    # Which policy model this sample trains and generates on; None when the run
+    # trains a single policy. Stamped by the custom generate function in
+    # multi-policy runs (--multi-policy-config).
+    trainer_model_id: str | None = None
     # prompt
     prompt: str | list[dict[str, str]] = ""
     tokens: list[int] = field(default_factory=list)
