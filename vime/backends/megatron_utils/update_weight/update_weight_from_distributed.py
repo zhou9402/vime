@@ -122,6 +122,11 @@ class UpdateWeightFromDistributed:
             self._source.draft = False
             client.draft = False
 
+        # LoRA adapter sync (disk-mode hot-load) while engines are still paused.
+        from .lora_sync import push_lora_adapter
+
+        push_lora_adapter(self.args, self.model, self.rollout_engines)
+
         if dist.get_rank() == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(

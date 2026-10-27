@@ -274,6 +274,17 @@ class VLLMEngine(RayActor):
             return {"ok": True}
         return response.json()
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str, timeout: float = 120.0):
+        """Hot-load or replace a LoRA adapter from a path local to the engine (load_inplace).
+
+        Requires the server to run with enable_lora and VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 (F04-6).
+        """
+        return self._make_request(
+            "v1/load_lora_adapter",
+            {"lora_name": lora_name, "lora_path": lora_path, "load_inplace": True},
+            timeout=timeout,
+        )
+
     def health_generate(self, timeout: float = 5.0) -> bool:
         if self.node_rank != 0:
             return True

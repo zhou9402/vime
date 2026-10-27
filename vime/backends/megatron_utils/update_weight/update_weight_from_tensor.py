@@ -400,6 +400,11 @@ class UpdateWeightFromTensor:
             else:
                 self._update_rollout_weights(megatron_local_weights, draft=True)
 
+        # LoRA adapter sync (disk-mode hot-load) while engines are still paused.
+        from .lora_sync import push_lora_adapter
+
+        push_lora_adapter(self.args, self.model, self._all_rollout_engines)
+
         # int4/fp4 post_process
         if self.rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:

@@ -1702,6 +1702,15 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 help="Shared-outer grouped-expert LoRA (gate_up lora_A and down lora_B shared across experts).",
             )
             parser.add_argument(
+                "--lora-rollout-cache-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Directory the colocated rollout engines read the LoRA adapter from during "
+                    "disk-mode adapter sync (default: <save>/rollout_adapter)."
+                ),
+            )
+            parser.add_argument(
                 "--check-lora-weight-equal",
                 action="store_true",
                 default=False,

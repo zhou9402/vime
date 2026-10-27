@@ -29,3 +29,7 @@ vime 正在从 miles 移植 LoRA 支持（`miles@ba28991834`，移植编号 F04�
 - **Review 修复**：LoRA checkpoint 不再触碰 Megatron 的 tracker——进度记录于 `<save>/latest_lora_iteration.txt`；恢复可用 `--lora-adapter-path <save>/iter_NNNNNNN/adapter` 或从 `--save` 自动解析。`--lora-rank>0` 与 `--offload-train` 在参数校验阶段即被拒绝。LoRA 参数校验改用 `ValueError`。`vime/utils/hf_utils/` 与 miles 逐字一致（仅改 import 前缀；DeepseekV4 的 sglang 分支改为 `NotImplementedError`）。
 
 - **F04-6**：vLLM 引擎启用——`_compute_server_args` 设置 `enable_lora/max_lora_rank/max_loras`（`lora_modules` 仅 debug 磁盘加载）；引擎子进程注入 `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`；rollout 请求经 `rollout_model_name` 路由到 adapter（服务名 `vime_lora`）。测试：`tests/utils/test_vllm_engine_lora.py` 与 `rollout_model_name` 谓词测试。
+
+- **F04-7**：adapter 权重同步（磁盘模式）——`update_weight/lora_sync.py` 导出 adapter（`export_lora_hf_named`），rank 0 原子写入 `<save>/rollout_adapter`（可用 `--lora-rollout-cache-dir` 覆盖；**非 colocate 时必需**，须位于所有引擎节点可读的共享文件系统——节点本地的 `--save` 不满足），各引擎通过 vLLM `/v1/load_lora_adapter`（`load_inplace=True`）热加载，无需 vLLM patch。`--check-lora-weight-equal` 写出 `adapter_sha256.json` 并在引擎加载前校验产物。已接入 tensor（colocate）与 NCCL 两条 updater（引擎暂停期间执行）。
+
+- **Review 修复（F04-7）**：拓扑在参数校验时强制——colocate 需要 `--save` 或 `--lora-rollout-cache-dir`；非 colocate 必须将 `--lora-rollout-cache-dir` 指向共享挂载。后续项：移植 miles Megatron fork 的 `disable_param_buffers_cpu_backup`/`disable_grad_buffers_cpu_backup` ddp_config 字段以支持 LoRA + `--offload-train`。
