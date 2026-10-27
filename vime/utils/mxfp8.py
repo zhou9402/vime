@@ -50,6 +50,39 @@ def should_use_mxfp8(
     return dtype in allowed_dtypes and shape[-1] % MXFP8_GROUP_SIZE == 0
 
 
+def assert_mxfp8_quantizable_expert(
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    allow_source_fp8: bool = True,
+) -> None:
+    """Raise if a routed-expert checkpoint tensor cannot be MXFP8-quantized.
+
+    Shared by the offline converter and the metadata-only rollout schema so
+    both reject the same unsupported experts. Expert tensors intentionally
+    excluded by user-requested skips (first/last BF16 layers,
+    --extra-high-precision-layers-hf) must be filtered by the caller first;
+    this helper applies only the built-in blocklist.
+    """
+    if ".experts." not in name or not name.endswith(".weight"):
+        return
+    packed_mxfp4_experts = dtype is torch.int8
+    if should_use_mxfp8(
+        name,
+        shape,
+        dtype,
+        allow_source_fp8=allow_source_fp8,
+        packed_mxfp4_experts=packed_mxfp4_experts,
+    ):
+        return
+    raise ValueError(
+        f"Unsupported MXFP8 expert {name}: shape={tuple(shape)}, dtype={dtype}; "
+        f"expected a quantizable expert with logical width divisible by {MXFP8_GROUP_SIZE} "
+        "and no high-precision exclusion"
+    )
+
+
 def mxfp8_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor to rowwise MXFP8 with compact, unswizzled scales."""
     from transformer_engine.pytorch import MXFP8Quantizer

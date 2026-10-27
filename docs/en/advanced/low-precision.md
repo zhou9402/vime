@@ -163,3 +163,9 @@ live weight sync then re-quantizes exported weights via
 Use `--extra-high-precision-layers-hf` / `--extra-high-precision-layers-megatron`
 to keep selected layers in BF16. MXFP8 requires Blackwell (SM100+) and has no
 ROCm support.
+
+Offline conversion: `python tools/convert_hf_to_mxfp8.py --model-dir <HF ckpt>
+--save-dir <out> [--num-layers-at-start-in-bf16 N] [--num-layers-at-end-in-bf16 N]
+[--extra-high-precision-layers-hf ...]`, or `--metadata-only` for a weightless
+rollout schema. BF16 and block-FP8/UE8M0 [128,128] sources are supported; the
+latter is rescaled to [1,32] without dequantizing when scales are power-of-two.

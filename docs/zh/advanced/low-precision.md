@@ -161,3 +161,9 @@ MXFP8 HF checkpoint（`tools/convert_hf_to_mxfp8.py` 转换）；权重同步时
 `weight_scale_inv`。可用 `--extra-high-precision-layers-hf` /
 `--extra-high-precision-layers-megatron` 让指定层保持 BF16。MXFP8 仅支持
 Blackwell（SM100+），不支持 ROCm。
+
+离线转换：`python tools/convert_hf_to_mxfp8.py --model-dir <HF ckpt>
+--save-dir <out> [--num-layers-at-start-in-bf16 N] [--num-layers-at-end-in-bf16 N]
+[--extra-high-precision-layers-hf ...]`，或用 `--metadata-only` 生成无权重
+rollout schema。支持 BF16 与块 FP8/UE8M0 [128,128] 源；当缩放为 2 的幂时，
+后者无需反量化即可重缩放为 [1,32]。
