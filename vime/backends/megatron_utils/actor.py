@@ -617,6 +617,29 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.save_hf is not None and self.role == "actor":
             save_hf_model_to_path(self.args, Path(self.args.save_hf.format(rollout_id=rollout_id)), self.model)
 
+        if getattr(self.args, "custom_megatron_post_save_hook_path", None) is not None:
+            # The hook consumes the checkpoint, so the save must be durable first.
+            # Finalization runs collectives, so every rank joins it before rank 0 proceeds.
+            if self.args.async_save:
+                from megatron.training.async_utils import maybe_finalize_async_save
+
+                maybe_finalize_async_save(blocking=True)
+
+            if dist.get_rank() == 0:
+                from megatron.training.checkpointing import get_checkpoint_name
+
+                from vime.utils.misc import load_function
+
+                checkpoint_dir = get_checkpoint_name(self.args.save, rollout_id, return_base_dir=True)
+                hf_checkpoint_dir = (
+                    self.args.save_hf.format(rollout_id=rollout_id)
+                    if self.args.save_hf is not None and self.role == "actor"
+                    else None
+                )
+                load_function(self.args.custom_megatron_post_save_hook_path)(
+                    self.args, rollout_id, checkpoint_dir, hf_checkpoint_dir
+                )
+
         if self.args.offload_train:
             self.sleep()
 

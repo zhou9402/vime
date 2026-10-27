@@ -1,4 +1,5 @@
 import logging
+import os
 
 import ray
 
@@ -70,7 +71,11 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
         # model/optimizer or this data progress have a durable joint checkpoint.
         ray.get(rollout_manager.training_completed.remote(rollout_id))
 
-        if release_train or should_run_periodic_action(
+        external_save = (
+            getattr(args, "save_trigger_sentinel", None) is not None
+            and os.path.exists(args.save_trigger_sentinel)
+        )
+        if release_train or external_save or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
             save_checkpoint(
@@ -81,7 +86,10 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
                 rollout_manager,
                 actor_trains=actor_trains,
                 restore_plan=restore_plan,
+                force_sync=external_save,
             )
+            if external_save:
+                os.remove(args.save_trigger_sentinel)
 
         offload_train(actor_trains)
         if args.offload_rollout and not release_train:

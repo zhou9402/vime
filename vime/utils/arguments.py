@@ -981,6 +981,26 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "Weights are saved with the same quantization config as `--hf-checkpoint`. "
                 ),
             )
+            parser.add_argument(
+                "--save-trigger-sentinel",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a sentinel file for externally-triggered checkpoint saving. If the file "
+                    "exists at an iteration's save point, a checkpoint is saved (force-sync) and the "
+                    "file is removed."
+                ),
+            )
+            parser.add_argument(
+                "--custom-megatron-post-save-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Import path (module.fn) to a custom function invoked on rank 0 after every "
+                    "checkpoint save. Signature: def hook(args, rollout_id: int, checkpoint_dir: str, "
+                    "hf_checkpoint_dir: str | None) -> None."
+                ),
+            )
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
@@ -2157,6 +2177,14 @@ def vime_validate_args(args):
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
+
+    if getattr(args, "save_trigger_sentinel", None) is not None:
+        if args.save is None:
+            raise ValueError("'--save' is required when save_trigger_sentinel is set.")
+
+    if getattr(args, "custom_megatron_post_save_hook_path", None) is not None:
+        if args.save is None:
+            raise ValueError("'--save' is required when custom_megatron_post_save_hook_path is set.")
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
