@@ -1,0 +1,317 @@
+diff --git a/vllm/config/weight_transfer.py b/vllm/config/weight_transfer.py
+index 99676526af..7ec3b4c7b9 100644
+--- a/vllm/config/weight_transfer.py
++++ b/vllm/config/weight_transfer.py
+@@ -9,7 +9,7 @@ from vllm.config.utils import config
+ class WeightTransferConfig:
+     """Configuration for weight transfer during RL training."""
+ 
+-    backend: Literal["nccl", "ipc", "sparse_nccl", "sharded_rdt", "nccl_m2n"] | str = (
++    backend: Literal["nccl", "ipc", "sparse_nccl", "sharded_rdt", "nccl_m2n", "p2p"] | str = (
+         "nccl"
+     )
+     """The backend to use for weight transfer. Validated against the
+diff --git a/vllm/distributed/weight_transfer/factory.py b/vllm/distributed/weight_transfer/factory.py
+index c0e88e03bf..e3ab6df766 100644
+--- a/vllm/distributed/weight_transfer/factory.py
++++ b/vllm/distributed/weight_transfer/factory.py
+@@ -250,6 +250,12 @@ WeightTransferEngineFactory.register_engine(
+ )
+ 
+ 
++WeightTransferEngineFactory.register_engine(
++    "p2p",
++    "vllm.distributed.weight_transfer.p2p_engine",
++    "P2PWeightTransferEngine",
++)
++
+ WeightTransferEngineFactory.register_engine(
+     "modelexpress",
+     "vllm.distributed.weight_transfer.modelexpress_engine",
+diff --git a/vllm/distributed/weight_transfer/p2p_engine.py b/vllm/distributed/weight_transfer/p2p_engine.py
+new file mode 100644
+index 0000000000..994dced25f
+--- /dev/null
++++ b/vllm/distributed/weight_transfer/p2p_engine.py
+@@ -0,0 +1,247 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""P2P (Mooncake RDMA) weight transfer engine — replica-free design.
++
++Unlike the NCCL/IPC backends, the bytes do not flow through a vLLM-driven
++handshake: the worker publishes ONE registered pinned staging buffer
++(`get_p2p_transfer_info` -> session id / address / capacity), the trainer
++RDMA-writes a packed HF-layout bucket straight into it, and then calls
++`load_weights_from_staged`, which verifies per-name SHA-256 checksums of the
++staged bytes and loads them through the model's own `load_weights` (the model
++reshards). No trainer-side model replica is needed.
++
++Mooncake (`mooncake-transfer-engine`) is an optional dependency and is imported
++lazily at `init_transfer_engine`; the session id is the local server name the
++transfer engine initializes with (`ip:port`, P2PHANDSHAKE metadata), which the
++trainer passes as the target of `batch_transfer_sync_write`.
++
++Writes are never retried by the trainer; a failed write marks the engine
++errored there (partial-target quarantine).
++"""
++
++import hashlib
++import os
++import socket
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++import torch
++
++from vllm.config.weight_transfer import WeightTransferConfig
++from vllm.distributed.weight_transfer.base import (
++    WeightTransferEngine,
++    WeightTransferInitInfo,
++    WeightTransferUpdateInfo,
++)
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
++logger = init_logger(__name__)
++
++
++@dataclass
++class P2PWeightTransferInitInfo(WeightTransferInitInfo):
++    """Worker-side init info for P2P weight transfer.
++
++    `staging_buffer_size_bytes` sizes the single staging buffer every bucket is
++    written into; the trainer must keep its packed buckets at or below this.
++    """
++
++    staging_buffer_size_bytes: int
++
++
++@dataclass
++class P2PWeightTransferUpdateInfo(WeightTransferUpdateInfo):
++    """One staged bucket: where each tensor sits in the staging buffer, in HF layout.
++
++    `manifest` entries are {"name", "offset", "nbytes", "dtype", "shape"} with
++    `dtype` a torch dtype name (e.g. "bfloat16"). `checksums` maps name ->
++    SHA-256 hex digest of the sender's bytes; entries present are verified
++    before loading.
++    """
++
++    manifest: list[dict[str, Any]]
++    checksums: dict[str, str] | None = None
++    target_rank: int | None = None
++    """collective_rpc fans out to every worker, but a bucket was RDMA-written
++    into exactly one rank's staging buffer: workers whose rank != target_rank
++    no-op (return no checksums)."""
++
++
++class P2PWeightTransferEngine(
++    WeightTransferEngine[P2PWeightTransferInitInfo, P2PWeightTransferUpdateInfo]
++):
++    """Worker engine for P2P weight transfer: one Mooncake-registered staging buffer."""
++
++    init_info_cls = P2PWeightTransferInitInfo
++    update_info_cls = P2PWeightTransferUpdateInfo
++    # The trainer rejects speculative decoding for p2p; refuse draft sessions too.
++    supports_draft_weight_update = False
++
++    def __init__(
++        self,
++        config: WeightTransferConfig,
++        vllm_config: "VllmConfig",
++        device: torch.device,
++        model: torch.nn.Module,
++    ) -> None:
++        super().__init__(config, vllm_config, device, model)
++        self._transfer_engine: Any | None = None
++        self._staging_buffer: torch.Tensor | None = None
++        self._session_id: str | None = None
++
++    def init_transfer_engine(self, init_info: P2PWeightTransferInitInfo) -> None:
++        if init_info.staging_buffer_size_bytes <= 0:
++            raise ValueError(
++                "staging_buffer_size_bytes must be positive, got "
++                f"{init_info.staging_buffer_size_bytes}"
++            )
++        # Host staging: no GPUDirect RDMA needed; loads move tensors to the device.
++        # Pinned where the platform supports it; pageable fallback (e.g. platforms
++        # without accelerator pinning) is still correct, just slower to DMA.
++        try:
++            staging = torch.empty(
++                init_info.staging_buffer_size_bytes, dtype=torch.uint8, pin_memory=True
++            )
++            staging.fill_(0)  # fault the pages in and validate the allocation
++        except RuntimeError:
++            logger.warning("pinned memory unavailable; using a pageable staging buffer")
++            staging = torch.empty(init_info.staging_buffer_size_bytes, dtype=torch.uint8)
++        transfer_engine, session_id = _create_transfer_engine()
++        ret = transfer_engine.register_memory(staging.data_ptr(), staging.numel())
++        if ret != 0:
++            raise RuntimeError(
++                f"Mooncake could not register the {staging.numel()}-byte staging "
++                f"buffer at {staging.data_ptr():#x}: error {ret}"
++            )
++        self._staging_buffer = staging
++        self._transfer_engine = transfer_engine
++        self._session_id = session_id
++        logger.info(
++            "P2P weight transfer ready: session %s, %d-byte staging buffer",
++            session_id,
++            staging.numel(),
++        )
++
++    def get_p2p_transfer_info(self) -> dict[str, Any]:
++        """The trainer-side rendezvous: Mooncake session + staging buffer address."""
++        self._check_ready()
++        assert self._staging_buffer is not None and self._session_id is not None
++        return {
++            "session_id": self._session_id,
++            "staging_address": self._staging_buffer.data_ptr(),
++            "capacity_nbytes": self._staging_buffer.numel(),
++        }
++
++    def load_weights_from_staged(self, update_info: dict[str, Any]) -> dict[str, str]:
++        """Verify and load one RDMA-written bucket; returns the received checksums."""
++        typed = self.parse_update_info(update_info)
++        if typed.target_rank is not None and typed.target_rank != self.parallel_config.rank:
++            return {}
++        return self._load_staged(typed)
++
++    def receive_weights(self, update_info: P2PWeightTransferUpdateInfo) -> None:
++        self._load_staged(update_info)
++
++    def start_weight_update(self) -> None:
++        # Weights load straight into the model; no layerwise-reload setup needed.
++        pass
++
++    def finish_weight_update(self) -> None:
++        pass
++
++    def shutdown(self) -> None:
++        if self._transfer_engine is not None and self._staging_buffer is not None:
++            ret = self._transfer_engine.unregister_memory(self._staging_buffer.data_ptr())
++            if ret != 0:
++                raise RuntimeError(
++                    "Mooncake could not unregister the staging buffer at "
++                    f"{self._staging_buffer.data_ptr():#x}: error {ret}"
++                )
++        self._transfer_engine = None
++        self._staging_buffer = None
++        self._session_id = None
++
++    def _load_staged(self, update_info: P2PWeightTransferUpdateInfo) -> dict[str, str]:
++        self._check_ready()
++        assert self._staging_buffer is not None
++        checksums: dict[str, str] = {}
++        weights = []
++        for entry in update_info.manifest:
++            name = entry["name"]
++            offset, nbytes = entry["offset"], entry["nbytes"]
++            dtype = getattr(torch, entry["dtype"])
++            shape = entry["shape"]
++            if offset + nbytes > self._staging_buffer.numel():
++                raise RuntimeError(
++                    f"manifest entry {name!r} [{offset}, {offset + nbytes}) runs past "
++                    f"the {self._staging_buffer.numel()}-byte staging buffer"
++                )
++            staged_bytes = self._staging_buffer[offset : offset + nbytes]
++            digest = hashlib.sha256(staged_bytes.numpy().tobytes()).hexdigest()
++            expected = (update_info.checksums or {}).get(name)
++            if expected is not None and expected != digest:
++                raise RuntimeError(
++                    f"P2P weight transfer checksum mismatch for {name!r}: "
++                    f"sent {expected}, received {digest}"
++                )
++            checksums[name] = digest
++            staged = staged_bytes.view(dtype).view(shape)
++            weights.append((name, staged.to(self.device, non_blocking=True)))
++        torch.accelerator.synchronize()
++
++        from vllm.model_executor.model_loader.mtp_validation import (
++            disable_mtp_completeness_check,
++        )
++
++        with disable_mtp_completeness_check():
++            self.model.load_weights(weights)
++        return checksums
++
++    def _check_ready(self) -> None:
++        if self._transfer_engine is None or self._staging_buffer is None:
++            raise RuntimeError(
++                "P2P weight transfer is not initialized; call "
++                "init_weight_transfer_engine first (backend='p2p')"
++            )
++
++
++def _create_transfer_engine() -> tuple[Any, str]:
++    try:
++        from mooncake.engine import TransferEngine
++    except ImportError as error:
++        raise ImportError(
++            "The p2p weight transfer backend requires the Mooncake transfer "
++            "engine; install mooncake-transfer-engine (vime: `pip install "
++            "vime[p2p]`)"
++        ) from error
++
++    protocol = os.environ.get("MOONCAKE_PROTOCOL", "rdma")
++    device = os.environ.get("MOONCAKE_DEVICE", "")
++    server_name = f"{_node_ip_address()}:{_free_port()}"
++    transfer_engine = TransferEngine()
++    ret = transfer_engine.initialize(server_name, "P2PHANDSHAKE", protocol, device)
++    if ret != 0:
++        raise RuntimeError(
++            f"Mooncake TransferEngine.initialize failed with error {ret} "
++            f"(server={server_name!r}, protocol={protocol!r}, device={device!r}); "
++            "check MOONCAKE_PROTOCOL/MOONCAKE_DEVICE"
++        )
++    return transfer_engine, server_name
++
++
++def _node_ip_address() -> str:
++    try:
++        import ray._private.services
++
++        return ray._private.services.get_node_ip_address()
++    except ImportError:
++        return socket.gethostbyname(socket.gethostname())
++
++
++def _free_port() -> int:
++    with socket.socket() as sock:
++        sock.bind(("", 0))
++        return sock.getsockname()[1]
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 1514fdf982..4e425c6eb7 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1533,6 +1533,29 @@ class Worker(WorkerBase):
+         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
+         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+ 
++    def get_p2p_transfer_info(self) -> dict:
++        """P2P backend rendezvous: Mooncake session + staging buffer address.
++
++        Reached through collective_rpc; raises unless the p2p backend is active.
++        """
++        engine = self._p2p_weight_transfer_engine()
++        return engine.get_p2p_transfer_info()
++
++    def load_weights_from_staged(self, update_info: dict) -> dict:
++        """Verify and load one RDMA-written staging bucket; returns checksums."""
++        engine = self._p2p_weight_transfer_engine()
++        return engine.load_weights_from_staged(update_info)
++
++    def _p2p_weight_transfer_engine(self):
++        self._check_weight_transfer_engine()
++        engine = self.weight_transfer_engine
++        if not hasattr(engine, "get_p2p_transfer_info"):
++            raise RuntimeError(
++                "get_p2p_transfer_info/load_weights_from_staged require the "
++                f"p2p weight transfer backend, got {type(engine).__name__}."
++            )
++        return engine
++
+     def shutdown_weight_transfer_engine(self) -> None:
+         """Release a trainer connection without shutting down inference."""
+         if self._weight_update_active:

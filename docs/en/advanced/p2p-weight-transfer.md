@@ -56,6 +56,16 @@ lockstep.
 python train.py ... --update-weight-transport p2p --p2p-transfer-timeout 30
 ```
 
+## Engine backend (vLLM patch)
+
+`docker/patch/latest/vllm-p2p-weight-transfer.patch` adds vLLM's `p2p` weight
+transfer backend (`vllm/distributed/weight_transfer/p2p_engine.py`): each
+worker allocates one Mooncake-registered staging buffer and exposes
+`get_p2p_transfer_info` / `load_weights_from_staged` as worker RPCs (reachable
+via `/collective_rpc`). `load_weights_from_staged` verifies per-name SHA-256
+checksums of the staged bytes, then loads through the model's own
+`load_weights`. Mooncake is installed only with `--build-arg ENABLE_P2P=1`.
+
 ## Verifier
 
 `python -m pytest tests/test_p2p_weight_transfer.py -x -q` covers the contract

@@ -233,6 +233,7 @@ COPY docker/patch/${PATCH_VERSION}/vllm-deepgemm-bf16.patch /tmp/vllm-deepgemm-b
 COPY docker/patch/${PATCH_VERSION}/vllm-deepep-optional-shrink.patch /tmp/vllm-deepep-optional-shrink.patch
 COPY docker/patch/${PATCH_VERSION}/vllm-draft-weights-cpu-backup.patch /tmp/vllm-draft-weights-cpu-backup.patch
 COPY docker/patch/${PATCH_VERSION}/vllm-check-weights.patch /tmp/vllm-check-weights.patch
+COPY docker/patch/${PATCH_VERSION}/vllm-p2p-weight-transfer.patch /tmp/vllm-p2p-weight-transfer.patch
 RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" && \
     cd "$VLLM_SITE" && \
     git apply -v /tmp/vllm-pull_weights.patch && \
@@ -254,6 +255,7 @@ RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirn
     git apply -v /tmp/vllm-deepgemm-bf16.patch && \
     git apply -v /tmp/vllm-deepep-optional-shrink.patch && \
     git apply -v /tmp/vllm-draft-weights-cpu-backup.patch && \
+    git apply -v /tmp/vllm-p2p-weight-transfer.patch && \
     rm /tmp/vllm-pull_weights.patch /tmp/vllm.patch \
        /tmp/vllm-score-centering.patch \
        /tmp/vllm-pd-request-metrics.patch \
@@ -270,7 +272,13 @@ RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirn
        /tmp/vllm-mm-decoder-only.patch \
        /tmp/vllm-rust-server-info.patch \
        /tmp/vllm-deepgemm-bf16.patch \
-       /tmp/vllm-deepep-optional-shrink.patch /tmp/vllm-draft-weights-cpu-backup.patch
+       /tmp/vllm-deepep-optional-shrink.patch /tmp/vllm-draft-weights-cpu-backup.patch \
+       /tmp/vllm-p2p-weight-transfer.patch
+
+# Optional Mooncake RDMA transport for --update-weight-transport=p2p (vime[p2p]).
+# Off by default; the p2p engine imports mooncake lazily and errors clearly without it.
+ARG ENABLE_P2P=0
+RUN if [ "$ENABLE_P2P" = "1" ]; then pip install --no-cache-dir mooncake-transfer-engine; fi
 
 # ====================================== Install main package ============================================
 COPY --from=vllm-rust-frontend /build/rust/target/release/vllm-rs /usr/local/lib/python3.12/dist-packages/vllm/vllm-rs

@@ -44,6 +44,14 @@ Kimi-K2 1T:53.3 s → 7.2 s 每次更新)。
 python train.py ... --update-weight-transport p2p --p2p-transfer-timeout 30
 ```
 
+## 引擎后端(vLLM patch)
+
+`docker/patch/latest/vllm-p2p-weight-transfer.patch` 为 vLLM 增加 `p2p` 权重传输后端
+(`vllm/distributed/weight_transfer/p2p_engine.py`):每个 worker 分配一块注册到 Mooncake 的
+暂存缓冲,并以 worker RPC(经 `/collective_rpc`)暴露 `get_p2p_transfer_info` /
+`load_weights_from_staged`。后者先校验暂存字节的逐参数 SHA-256,再经模型自身的
+`load_weights` 加载。Mooncake 仅在 `--build-arg ENABLE_P2P=1` 时安装。
+
 ## Verifier
 
 `python -m pytest tests/test_p2p_weight_transfer.py -x -q` 用 fake 覆盖合约:
