@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import abc
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from vime.utils.types import Sample
 
 if TYPE_CHECKING:
+    from argparse import Namespace
+
+    from vime.data.data_source import DataSource
     from vime.data.transport import DiskPayloadRef
+    from vime.rollout.vllm_rollout import GenerateState
 
 
 @dataclass
@@ -23,6 +30,67 @@ class RolloutFnTrainOutput:
 class RolloutFnEvalOutput:
     data: dict[str, dict[str, Any]]
     metrics: dict[str, Any] = None
+
+
+@dataclass(frozen=True)
+class RolloutFnConstructorInput:
+    args: Namespace
+    data_source: DataSource
+
+
+@dataclass(frozen=True)
+class RolloutFnBaseInput:
+    rollout_id: int
+
+    @property
+    def evaluation(self):
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class RolloutFnTrainInput(RolloutFnBaseInput):
+    # engine weight version, None before the first weight update
+    weight_version: int | None = None
+    # which policy model asked for this rollout; None when the run trains one policy
+    trainer_model_id: str | None = None
+
+    @property
+    def evaluation(self):
+        return False
+
+
+@dataclass(frozen=True)
+class RolloutFnEvalInput(RolloutFnBaseInput):
+    invocation_id: str = field(default_factory=lambda: uuid4().hex)
+    generate_state: GenerateState | None = None
+    weight_version: str | None = None
+    hf_dir: str | None = None
+
+    @property
+    def evaluation(self):
+        return True
+
+
+RolloutFnInput = RolloutFnTrainInput | RolloutFnEvalInput
+RolloutFnOutput = RolloutFnTrainOutput | RolloutFnEvalOutput
+
+
+class BaseRolloutFn(abc.ABC):
+    def __init__(self, input: RolloutFnConstructorInput) -> None:
+        self.constructor_input = input
+
+    @abc.abstractmethod
+    def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
+        raise NotImplementedError
+
+    def save(self, directory: Path) -> None:
+        return None
+
+    def load(self, directory: Path) -> None:
+        return None
+
+    async def dispose(self) -> None:
+        return None
 
 
 def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
