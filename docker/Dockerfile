@@ -232,6 +232,7 @@ COPY docker/patch/${PATCH_VERSION}/vllm-rust-server-info.patch /tmp/vllm-rust-se
 COPY docker/patch/${PATCH_VERSION}/vllm-deepgemm-bf16.patch /tmp/vllm-deepgemm-bf16.patch
 COPY docker/patch/${PATCH_VERSION}/vllm-deepep-optional-shrink.patch /tmp/vllm-deepep-optional-shrink.patch
 COPY docker/patch/${PATCH_VERSION}/vllm-draft-weights-cpu-backup.patch /tmp/vllm-draft-weights-cpu-backup.patch
+COPY docker/patch/${PATCH_VERSION}/vllm-nvfp4-inloop.patch /tmp/vllm-nvfp4-inloop.patch
 RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" && \
     cd "$VLLM_SITE" && \
     git apply -v /tmp/vllm-pull_weights.patch && \
@@ -252,6 +253,7 @@ RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirn
     git apply -v /tmp/vllm-deepgemm-bf16.patch && \
     git apply -v /tmp/vllm-deepep-optional-shrink.patch && \
     git apply -v /tmp/vllm-draft-weights-cpu-backup.patch && \
+    git apply -v /tmp/vllm-nvfp4-inloop.patch && \
     rm /tmp/vllm-pull_weights.patch /tmp/vllm.patch \
        /tmp/vllm-score-centering.patch \
        /tmp/vllm-pd-request-metrics.patch \
@@ -267,7 +269,8 @@ RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirn
        /tmp/vllm-mm-decoder-only.patch \
        /tmp/vllm-rust-server-info.patch \
        /tmp/vllm-deepgemm-bf16.patch \
-       /tmp/vllm-deepep-optional-shrink.patch /tmp/vllm-draft-weights-cpu-backup.patch
+       /tmp/vllm-deepep-optional-shrink.patch /tmp/vllm-draft-weights-cpu-backup.patch \
+       /tmp/vllm-nvfp4-inloop.patch
 
 # ====================================== Install main package ============================================
 COPY --from=vllm-rust-frontend /build/rust/target/release/vllm-rs /usr/local/lib/python3.12/dist-packages/vllm/vllm-rs

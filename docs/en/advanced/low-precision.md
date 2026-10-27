@@ -187,3 +187,9 @@ Offline conversion: `python tools/convert_hf_to_nvfp4.py --model-dir <HF ckpt>
 main language decoder are quantized (gate/up share one global scale); MTP,
 shared experts and dense layers stay BF16. Live weight sync re-quantizes via
 `megatron_to_hf/processors/quantizer_nvfp4.py` in the same layout.
+
+In-loop NVFP4 weight updates (NCCL/IPC) require the vLLM patch
+`docker/patch/latest/vllm-nvfp4-inloop.patch` (applied by the Dockerfile): the
+layerwise reload machinery restores layers in kernel format, so the patch makes
+`ModelOptNvFp4FusedMoE` recreate checkpoint-format parameters before an update.
+Verifier: `tests/test_nvfp4_inloop_recreate.py` (runs on CPU inside the image).

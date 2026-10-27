@@ -183,3 +183,9 @@ TE 的 `NVTE_NVFP4_4OVER6*` 开关。NVFP4 不支持 ROCm。
 [--extra-high-precision-layers-hf ...]`。仅量化主语言解码器中的 MoE 路由专家
 GEMM（gate/up 共享同一全局缩放）；MTP、共享专家与 dense 层保持 BF16。在线
 权重同步通过 `megatron_to_hf/processors/quantizer_nvfp4.py` 以相同布局重新量化。
+
+NVFP4 在线权重更新（NCCL/IPC）依赖 vLLM 补丁
+`docker/patch/latest/vllm-nvfp4-inloop.patch`（Dockerfile 已应用）：layerwise
+reload 会以 kernel 格式恢复层参数，该补丁让 `ModelOptNvFp4FusedMoE` 在更新前
+重建 checkpoint 格式参数。验证：`tests/test_nvfp4_inloop_recreate.py`
+（镜像内 CPU 可跑）。
