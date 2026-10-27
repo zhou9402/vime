@@ -1637,6 +1637,82 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
+        def add_lora_arguments(parser):
+            """Add LoRA arguments (port of miles LoraConfig; native Megatron path only)."""
+            parser.add_argument("--lora-rank", type=int, default=0, help="LoRA rank. Set to 0 to disable LoRA.")
+            parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha for scaling.")
+            parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout rate.")
+            parser.add_argument(
+                "--lora-a-init-method",
+                type=str,
+                choices=["xavier", "kaiming", "normal"],
+                default="xavier",
+                help="LoRA A initialization; B is zero-initialized.",
+            )
+            parser.add_argument(
+                "--lora-type",
+                type=str,
+                choices=["lora", "canonical_lora"],
+                default="lora",
+                help="LoRA variant: 'lora' (standard) or 'canonical_lora' (split Q/K/V).",
+            )
+            parser.add_argument(
+                "--target-modules",
+                type=str,
+                default=None,
+                help=(
+                    "LoRA targets: omit or use 'all-linear' for the HF model defaults, or provide "
+                    "comma-separated groups (attn,mlp,unembed) or explicit HF targets."
+                ),
+            )
+            parser.add_argument(
+                "--exclude-modules", type=str, default=None, help="Modules to exclude from LoRA (comma-separated)."
+            )
+            parser.add_argument(
+                "--lora-adapter-path", type=str, default=None, help="Path to pre-trained LoRA adapter weights."
+            )
+            parser.add_argument(
+                "--lora-sync-from-tensor",
+                action="store_true",
+                default=False,
+                help="Sync LoRA weights via tensor instead of file (follow-up; file sync is the default).",
+            )
+            parser.add_argument(
+                "--lora-base-cpu-backup",
+                action="store_true",
+                default=False,
+                help=(
+                    "LoRA + colocate: keep a CPU mirror of base weights and skip per-step base sync. "
+                    "Trades host RAM for faster onload/offload."
+                ),
+            )
+            parser.add_argument(
+                "--lora-train-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train LoRA adapters in Megatron but keep rollout engines on the frozen base policy: "
+                    "engine-side LoRA serving and adapter weight sync are disabled."
+                ),
+            )
+            parser.add_argument(
+                "--experts-shared-outer-loras",
+                action="store_true",
+                default=False,
+                help="Shared-outer grouped-expert LoRA (gate_up lora_A and down lora_B shared across experts).",
+            )
+            parser.add_argument(
+                "--check-lora-weight-equal",
+                action="store_true",
+                default=False,
+                help=(
+                    "Verify the megatron->vllm LoRA adapter weight sync: the trainer ships a per-tensor "
+                    "sha256 manifest and each rollout engine fails the load on any mismatch/missing/extra name. "
+                    "The LoRA analogue of --check-weight-update-equal."
+                ),
+            )
+            return parser
+
         def add_dspark_training_arguments(parser):
             """Add DSpark (semi-autoregressive speculative decoding) training arguments."""
             parser.add_argument(
@@ -1792,6 +1868,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
+        parser = add_lora_arguments(parser)
         parser = add_dspark_training_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
@@ -1874,6 +1951,9 @@ def parse_args(add_custom_arguments=None, *, return_restore_plan=False):
 
     if not args.debug_rollout_only:
         megatron_validate_args(args)
+        from vime.utils.lora.arguments import validate_lora_args_after_megatron
+
+        validate_lora_args_after_megatron(args)
 
     if not args.debug_train_only:
         vllm_validate_args(args)
@@ -2401,5 +2481,9 @@ def vime_validate_args(args):
             raise ValueError(
                 "Trainer fault tolerance requires a unique --save-debug-rollout-data path containing {rollout_id}"
             )
+
+    from vime.utils.lora.arguments import validate_lora_args
+
+    validate_lora_args(args)
 
     return args, restore_plan
