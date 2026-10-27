@@ -12,5 +12,6 @@ Rollout 与调度
    ../advanced/pd-disaggregation.md
    ../advanced/external-rollout-engines.md
    ../advanced/delta-weight-sync.md
+   ../advanced/weight-sync-verification.md
    ../advanced/vllm-config.md
    ../advanced/speculative-decoding.md
