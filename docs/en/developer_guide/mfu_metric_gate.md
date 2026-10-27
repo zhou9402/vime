@@ -68,3 +68,14 @@ spec errors or fails with at least 10 baselines. The store path comes from
 `./metric_history.db`. `--write-baseline` records trusted history (scheduled
 builds only); `--mark-untrusted-sha SHA` revokes a bad commit's runs. The
 end-to-end check is `python tests/ci/metric_history/verify_gate_e2e.py`.
+
+## Buildkite wiring
+
+The CPU verifiers run in the `plugin-contracts` step of
+`.buildkite/pipeline.yml`: `tests/ci/flops_oracle/verify_flops.py` (V5),
+`pytest tests/ci/metric_history`, and `tests/ci/metric_history/verify_gate_e2e.py`
+(V1). GPU-suite opt-in: a test exports `VIME_CI_GATE_RECORD_DIR` (per-build
+directory, uploaded as a build artifact) and a follow-up step runs
+`run_gate.py --write-baseline` on scheduled builds with
+`VIME_METRIC_HISTORY_PATH` naming the shared SQLite store. No hostPath
+persistence is assumed; the store travels as a Buildkite artifact.

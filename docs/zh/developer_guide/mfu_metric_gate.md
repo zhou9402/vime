@@ -64,3 +64,12 @@ register_ci_gate(metric_key="perf/actor_train_mfu")  # 只记录不判定
 写入可信历史（仅定时构建使用）；`--mark-untrusted-sha SHA` 撤销某个坏
 commit 的全部历史。端到端自检：
 `python tests/ci/metric_history/verify_gate_e2e.py`。
+
+## Buildkite 接线
+
+CPU 验证器在 `.buildkite/pipeline.yml` 的 `plugin-contracts` 步骤中运行：
+`tests/ci/flops_oracle/verify_flops.py`（V5）、`pytest tests/ci/metric_history`、
+`tests/ci/metric_history/verify_gate_e2e.py`（V1）。GPU 套件接入方式：测试导出
+`VIME_CI_GATE_RECORD_DIR`（每次构建的目录，作为构建产物上传），后续步骤在定时
+构建上运行 `run_gate.py --write-baseline`，`VIME_METRIC_HISTORY_PATH` 指向共享
+SQLite 存储。不假设存在 hostPath 持久化，存储以 Buildkite artifact 形式流转。

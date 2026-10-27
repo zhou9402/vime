@@ -121,6 +121,10 @@ steps:
           python tests/test_cp_utils.py
           python tests/test_metric_report.py
           python tests/test_metric_report_dist.py
+          # FLOPs oracle (V5) + metric-history gate (V1): CPU-only verifiers.
+          python tests/ci/flops_oracle/verify_flops.py --impl vime/utils/flops_model.py
+          python -m pytest tests/ci/flops_oracle/test_oracle_selfcheck.py tests/ci/metric_history -q
+          python tests/ci/metric_history/verify_gate_e2e.py
           python tests/test_loss_cp_invariance.py
           python tests/test_sample.py
           python tests/test_cispo_loss.py
