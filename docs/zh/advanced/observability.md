@@ -107,3 +107,10 @@ git 状态（commit + dirty hash）。argv 和环境变量中的密钥会被哈�
 
 设置 `VIME_DEBUG_PYSPY_DUMP_INTERVAL=<秒数>` 后，后台线程会周期性地对节点上所有 python/ray/vLLM
 进程执行 `py-spy dump` 并把堆栈打印到 stdout。默认关闭；需要 PATH 上有 `py-spy`。
+
+## Rollout dump 工具
+
+`python -m vime.tools.display_debug_rollout_data --load-debug-rollout-data 'dump/rollout_{rollout_id}.pt'`
+打印 dump 中白名单字段和聚合指标（支持 `.pt` 和 `.straw.json`）。
+`python -m vime.tools.replay_reward_fn --rollout-data-path dump.pt --custom-rm-path my_module.my_rm`
+对保存的 dump 重放自定义 reward 函数。离线 dump 的每秒速率指标无意义，已隐藏。

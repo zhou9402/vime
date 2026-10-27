@@ -111,3 +111,11 @@ record path, default `$VIME_SCRIPT_ENV_REPORT`) and `--env-report-interval-secon
 Set `VIME_DEBUG_PYSPY_DUMP_INTERVAL=<seconds>` to start a background thread that periodically runs
 `py-spy dump` on every python/ray/vLLM process on the node and prints stacks to stdout. Off by
 default; requires `py-spy` on PATH.
+
+## Rollout dump tools
+
+`python -m vime.tools.display_debug_rollout_data --load-debug-rollout-data 'dump/rollout_{rollout_id}.pt'`
+prints whitelisted sample fields and aggregate metrics for saved rollout dumps (legacy `.pt` or
+`.straw.json` archives). `python -m vime.tools.replay_reward_fn --rollout-data-path dump.pt
+--custom-rm-path my_module.my_rm` re-runs a custom reward function against a saved dump.
+Per-second metrics are meaningless for offline dumps and are hidden.
