@@ -162,6 +162,9 @@ class RolloutGroupRef(DiskPayloadRef):
     receipt: CommitReceipt | None = None
     # A fork reuses the payload but supplies positions in its own accepted log.
     source_positions: tuple[int, ...] | None = None
+    # Oldest numeric sample weight version, stamped at publish time so the
+    # scheduler can judge staleness without materializing the payload.
+    min_weight_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -273,7 +276,15 @@ def pack_rollout_group(group, args, rollout_id, *, controller=None):
         if controller is None:
             raise ValueError("Queue group has a lease but no coordinator binding")
         receipt = ray.get(controller.complete.remote(lease, ref.manifest))
-    return RolloutGroupRef(receipt.result_ref if receipt else ref.manifest, ref.root, first.index, receipt)
+    from vime.utils.staleness import min_weight_version_of
+
+    return RolloutGroupRef(
+        receipt.result_ref if receipt else ref.manifest,
+        ref.root,
+        first.index,
+        receipt,
+        min_weight_version=min_weight_version_of(group),
+    )
 
 
 def release_rollout_publications(group, args):

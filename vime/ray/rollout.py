@@ -18,7 +18,7 @@ from vime.observability.rollout_data_utils import (
 )
 from vime.observability.rollout_metrics import log_eval_rollout_data, log_rollout_data
 from vime.rollout.base_types import RolloutFnTrainOutput, call_rollout_fn
-from vime.rollout.sample_hooks import set_current_rollout_id
+from vime.rollout.sample_hooks import rollout_context, set_current_rollout_id
 from vime.utils.cleanup import Cleanup
 from vime.utils.http_utils import init_http_client
 from vime.utils.misc import load_function
@@ -547,7 +547,13 @@ class RolloutManager:
                     str(version).isascii() and str(version).isdigit() for version in versions
                 )
                 self.weight_version = max(map(int, versions)) if valid else None
-            data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+                # The rollout context carries the version through any custom
+                # rollout-fn wrapping (partials, decorators) to the fully-async
+                # staleness check; no signature sniffing needed.
+                with rollout_context(rollout_id, weight_version=self.weight_version):
+                    data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+            else:
+                data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             if self.args.rollout_data_transport == "straw":
                 samples = getattr(data, "samples", None)
                 data = accept_raw_rollout(data, self.args, rollout_id, controller=self.controller)

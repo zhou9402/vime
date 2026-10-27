@@ -37,10 +37,12 @@ import time
 from vime.data.transport import discard_rollout_group, publish_rollout_async
 from vime.rollout.base_types import RolloutFnTrainOutput, finalize_rollout_groups
 from vime.rollout.filter_hub.base_types import call_dynamic_filter
+from vime.rollout.sample_hooks import current_rollout_weight_version
 from vime.rollout.vllm_rollout import GenerateState, generate_and_rm_group
 from vime.utils.async_utils import run
 from vime.utils.http_utils import get_rollout_num_engines
 from vime.utils.misc import load_function
+from vime.utils.staleness import group_is_stale
 from vime.utils.types import Sample
 
 __all__ = [
@@ -265,10 +267,13 @@ class AsyncRolloutWorker:
         return _cb
 
 
-async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput | list[list[Sample]]:
+async def _generate_rollout_async(
+    args, rollout_id: int, data_buffer, current_weight_version: int | None = None
+) -> RolloutFnTrainOutput | list[list[Sample]]:
     filters_enabled = bool(
         getattr(args, "dynamic_sampling_filter_path", None) or getattr(args, "rollout_sample_filter_path", None)
     )
+    max_weight_staleness = getattr(args, "max_weight_staleness", None)
     worker = _get_worker(args, data_buffer)
     worker.resume()
 
@@ -282,6 +287,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
 
     collected = []
     dropped_count = 0
+    stale_dropped = 0
     drop_reasons: dict[str, int] = {}
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path)
@@ -300,6 +306,18 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         drained = 0
         for _gid, group in worker.get_completed_groups(limit=target - len(collected)):
             drained += 1
+            # Staleness is judged at drain time against the version the
+            # trainer is about to train on (miles: get-time ``_drop_stale``).
+            if group_is_stale(group, current_weight_version, max_weight_staleness):
+                await asyncio.to_thread(
+                    discard_rollout_group,
+                    group,
+                    args,
+                    "stale",
+                    controller=getattr(data_buffer, "controller", None),
+                )
+                stale_dropped += 1
+                continue
             verdict = call_dynamic_filter(dynamic_filter, args, group)
             if verdict.keep:
                 if args.rollout_data_transport == "straw":
@@ -348,6 +366,10 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     metrics = {f"rollout/dynamic_filter/drop_{reason}": count for reason, count in drop_reasons.items()}
     metrics["rollout/dynamic_filter/dropped_groups"] = dropped_count
     metrics["rollout/dynamic_filter/dropped_ratio"] = dropped_count / (len(collected) + dropped_count)
+    if max_weight_staleness is not None:
+        metrics["rollout/staleness/dropped_groups"] = stale_dropped
+        metrics["rollout/staleness/max_weight_staleness"] = max_weight_staleness
+    metrics_enabled = filters_enabled or max_weight_staleness is not None
     if args.rollout_sample_filter_path is not None:
         # Preserve the calling thread/context of custom batch hooks.
         output = finalize_rollout_groups(
@@ -359,18 +381,31 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
             args,
             rollout_id,
             collected,
-            metrics if filters_enabled else None,
+            metrics if metrics_enabled else None,
             controller=getattr(data_buffer, "controller", None),
         )
-    return output if filters_enabled or args.rollout_data_transport == "straw" else output.samples
+    return output if metrics_enabled or args.rollout_data_transport == "straw" else output.samples
 
 
-def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool = False):
-    """Vime ``--rollout-function-path`` entrypoint."""
+def generate_rollout_fully_async(
+    args, rollout_id, data_buffer, evaluation: bool = False, current_weight_version: int | None = None
+):
+    """Vime ``--rollout-function-path`` entrypoint.
+
+    ``current_weight_version`` drives ``--max-weight-staleness``. It defaults
+    to the manager-sampled version carried by ``rollout_context``; the kwarg
+    is an explicit override (used by tests).
+    """
 
     if evaluation:
         raise ValueError("fully-async rollout doesn't support evaluation mode")
+    if current_weight_version is None:
+        current_weight_version = current_rollout_weight_version()
     worker = _get_worker(args, data_buffer)
     if not isinstance(worker, AsyncRolloutWorker):
-        return worker.generate(rollout_id, prefetch=worker.capacity)
-    return run(_generate_rollout_async(args, rollout_id, data_buffer))
+        return worker.generate(rollout_id, prefetch=worker.capacity, current_weight_version=current_weight_version)
+    if current_weight_version is None:
+        # Keep the legacy 3-argument call shape for custom/monkeypatched
+        # _generate_rollout_async implementations.
+        return run(_generate_rollout_async(args, rollout_id, data_buffer))
+    return run(_generate_rollout_async(args, rollout_id, data_buffer, current_weight_version))

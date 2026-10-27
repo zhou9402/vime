@@ -30,6 +30,7 @@ from vime.rollout.sample_hooks import rollout_context
 from vime.utils.async_utils import get_async_loop
 from vime.utils.http_utils import get_rollout_num_engines, init_http_client
 from vime.utils.misc import load_function
+from vime.utils.staleness import group_is_stale
 from vime.utils.types import Sample
 
 
@@ -158,10 +159,13 @@ class RolloutScheduler:
                 self.running_workers.clear()
                 self.condition.notify_all()
 
-    def generate(self, rollout_id, *, prefetch):
+    def generate(self, rollout_id, *, prefetch, current_weight_version=None):
         groups = []
         dropped_count = 0
+        stale_dropped = 0
+        stale_groups = []
         drop_reasons = Counter()
+        max_weight_staleness = getattr(self.args, "max_weight_staleness", None)
         with self.condition:
             if self.error is not None:
                 raise self.error
@@ -184,6 +188,16 @@ class RolloutScheduler:
                     self.condition.wait()
                     continue
                 group, verdict = self.ready.popleft()
+                # Staleness is judged at collection time against the version
+                # the trainer is about to train on; over-limit groups are
+                # discarded and replaced, like dynamic-filter rejects.
+                if verdict.keep and group_is_stale(group, current_weight_version, max_weight_staleness):
+                    # Discard after the lock is released: rejection talks to
+                    # the controller actor, and the collector shares this lock.
+                    stale_groups.append(group)
+                    stale_dropped += 1
+                    self.condition.notify_all()
+                    continue
                 # Fully async continuously replaces rejected groups. The
                 # finite-batch keep_when_insufficient fallback does not apply.
                 if not verdict.keep:
@@ -197,9 +211,14 @@ class RolloutScheduler:
                     self.demand -= 1
                 self.condition.notify_all()
 
+        for group in stale_groups:
+            discard_rollout_group(group, self.args, "stale", controller=self.controller)
         metrics = {f"rollout/dynamic_filter/drop_{reason}": count for reason, count in drop_reasons.items()}
         metrics["rollout/dynamic_filter/dropped_groups"] = dropped_count
         metrics["rollout/dynamic_filter/dropped_ratio"] = dropped_count / (len(groups) + dropped_count)
+        if max_weight_staleness is not None:
+            metrics["rollout/staleness/dropped_groups"] = stale_dropped
+            metrics["rollout/staleness/max_weight_staleness"] = max_weight_staleness
         # Publish a manifest of group references outside the scheduler lock.
         return finalize_rollout_groups(self.args, rollout_id, groups, metrics, controller=self.controller)
 

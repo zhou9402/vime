@@ -647,6 +647,21 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_fully_async_arguments(parser):
+            parser.add_argument(
+                "--max-weight-staleness",
+                type=int,
+                default=None,
+                help=(
+                    "Fully-async rollout only: discard a completed group at drain time when its oldest "
+                    "generated-token weight version lags the current serving weight version by more than "
+                    "this many updates (the limit is inclusive; prompt-KV staleness is not considered). "
+                    "Groups without parseable weight versions are always kept. "
+                    "None (default) disables the filter. Mirrors miles --max-weight-staleness."
+                ),
+            )
+            return parser
+
         def add_fault_tolerance_arguments(parser):
             parser.add_argument(
                 "--rollout-session-id",
@@ -1780,6 +1795,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_cluster_arguments(parser)
         parser = add_train_arguments(parser)
         parser = add_rollout_arguments(parser)
+        parser = add_fully_async_arguments(parser)
         parser = add_fault_tolerance_arguments(parser)
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
@@ -2389,6 +2405,12 @@ def vime_validate_args(args):
             args.rollout_function_path = "vime.rollout.fully_async_rollout.generate_rollout_fully_async"
         if args.eval_function_path is None:
             args.eval_function_path = "vime.rollout.vllm_rollout.generate_rollout"
+
+    if getattr(args, "max_weight_staleness", None) is not None:
+        if args.max_weight_staleness < 0:
+            raise ValueError("--max-weight-staleness must be >= 0.")
+        if "fully_async" not in args.rollout_function_path:
+            raise ValueError("--max-weight-staleness requires fully-async rollout.")
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

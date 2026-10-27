@@ -10,6 +10,7 @@ from vime.utils.types import Sample
 
 _current_rollout_id: int | None = None
 _task_rollout_id = ContextVar("rollout_sample_hook_id", default=None)
+_task_weight_version = ContextVar("rollout_current_weight_version", default=None)
 
 
 def set_current_rollout_id(rollout_id: int | None) -> None:
@@ -17,13 +18,25 @@ def set_current_rollout_id(rollout_id: int | None) -> None:
     _current_rollout_id = rollout_id
 
 
+def current_rollout_weight_version() -> int | None:
+    """Serving weight version sampled by the manager for the active rollout."""
+    return _task_weight_version.get()
+
+
 @contextmanager
-def rollout_context(rollout_id):
-    """Keep concurrent worker requests' hook contexts independent."""
+def rollout_context(rollout_id, weight_version=None):
+    """Keep concurrent worker requests' hook contexts independent.
+
+    ``weight_version`` carries the manager-sampled serving version so deeply
+    wrapped/custom rollout functions (partials, decorators) see it without a
+    signature change.
+    """
     token = _task_rollout_id.set(rollout_id)
+    version_token = _task_weight_version.set(weight_version)
     try:
         yield
     finally:
+        _task_weight_version.reset(version_token)
         _task_rollout_id.reset(token)
 
 

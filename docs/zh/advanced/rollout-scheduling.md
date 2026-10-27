@@ -75,6 +75,8 @@ $$K=\left\lfloor\frac{CE}{G}\right\rfloor$$
 
 当前 serving 版本为 $v$，组内最早生成 token 使用版本 $u$，则 staleness 为 $v-u$。刚完成的回复也可能因前缀很早生成而已经过期。straw 优先取完整组，再 partial 组，再新 prompt；各阶段内优先较老的 token 权重版本，同版本按 FIFO。排序不会自动丢弃旧样本。
 
+`--max-weight-staleness N`（仅 fully async，默认关闭）把排序升级为硬上界：drain 时，若某组相对当前 serving 版本的 staleness 超过 $N$，该组被丢弃并补新组，计数见 `rollout/staleness/dropped_groups`。上界为含等值判断，不考虑 prompt KV 的过期；权重版本不可解析的组一律保留。object-store 传输下，检查发生在 manager 排空 worker 输出队列时；straw 传输下，检查发生在分布式调度器收集组时，依据发布时记录在 `RolloutGroupRef` 上的最老版本摘要。
+
 若 producer 每秒稳定产出 $\lambda$ 个被接受的组，训练每秒消费 $\mu$ 个，吞吐上限为 $\min(\lambda,\mu)$。当 $\lambda>\mu$，无限队列约以 $\lambda-\mu$ 的速度增长，需要 backpressure。稳定队列按 Little 定律有 $L=\lambda W_q$，其中 $L$ 是平均排队组数、$W_q$ 是平均队内时间。只有其他环节吃得下，增加 producer 才有用。
 
 同时观察 `staleness/mean`、`staleness/max`、有效组吞吐、reward、mask/clip 比例及训推 log-prob 差异。Off-policy 修正不保证任意延迟都无害。[系统耗时推导](rl-systems.md#async)与 [PipelineRL 论文](https://arxiv.org/abs/2509.19128)可作为流水线背景，实际行为以上述 vime 实现为准。
