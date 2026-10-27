@@ -15,3 +15,5 @@ vime 正在从 miles 移植 LoRA 支持（`miles@ba28991834`，移植编号 F04�
 - **F04-3a**：native LoRA 核心——`vime/backends/megatron_utils/lora/native/{config,distributed,naming}.py` 与 `spec/base.py`（`LoRAConfig`、TP=1 直通即可运行的 TP/EP/SP 通信辅助、`ConverterNaming`/`DeclaredNaming`，经新增的 `megatron_to_hf.convert_to_hf_names` 桥接、架构 spec 契约）。测试：`tests/backends/megatron_utils/lora/native/test_core.py`。
 
 - **F04-3b**：native LoRA 模块——`native/modules/linear.py`（`NativeLoRAAdapter`、`LoRALinear`、`LoRASplitQKV`/`FC1`、forward hook 挂接）、`native/modules/lm_head.py`、`native/spec/layout.py`（模块布局/fused attach）。测试：`test_modules.py`（QKV 排列、初始化分布、fused-norm 宿主契约）。
+
+- **F04-3c**：架构 spec——`native/spec/{attention,mlp,lm_head}.py`（GQA/带门控 GQA/MLA 注意力布局、split+fused gate/up MLP）与 `native/merge.py`（用于全量 HF 导出的 `MergedWeights` 视图）。测试：`test_specs.py`（裸模块挂接、零初始化等价、梯度流、target 选择、合并 delta）。

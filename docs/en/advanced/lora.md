@@ -15,3 +15,5 @@ Training-side LoRA (Megatron, native path) and vLLM adapter loading/sync land in
 - **F04-3a**: native LoRA core — `vime/backends/megatron_utils/lora/native/{config,distributed,naming}.py` + `spec/base.py` (`LoRAConfig`, TP/EP/SP collectives with TP=1 passthrough, `ConverterNaming`/`DeclaredNaming` via the new `megatron_to_hf.convert_to_hf_names` shim, architecture spec contracts). Tests: `tests/backends/megatron_utils/lora/native/test_core.py`.
 
 - **F04-3b**: native LoRA modules — `native/modules/linear.py` (`NativeLoRAAdapter`, `LoRALinear`, `LoRASplitQKV`/`FC1`, forward-hook attach), `native/modules/lm_head.py`, `native/spec/layout.py` (module layouts / fused attach). Tests: `test_modules.py` (QKV permutation, init distributions, fused-norm host contract).
+
+- **F04-3c**: architecture specs — `native/spec/{attention,mlp,lm_head}.py` (GQA/gated-GQA/MLA attention layouts, split+fused gate/up MLP) and `native/merge.py` (`MergedWeights` view for full-model HF export). Tests: `test_specs.py` (attach on bare blocks, zero-init no-op, grad flow, target selection, merge deltas).
