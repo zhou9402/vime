@@ -143,3 +143,10 @@ bash scripts/low_precision/run-kimi-k2-Thinking-int4.sh
 ```
 
 多机环境请根据集群配置启动 Ray 服务。
+
+## 低精度格式的数值基准
+
+`vime/utils/quant_ref.py` 提供纯 torch 参考实现（UE8M0 缩放的 MXFP8、
+E4M3 块缩放的 NVFP4、块 FP8 反量化），作为所有低精度量化器的确定性
+数值基准；契约由 `tests/test_low_precision_quant_ref.py` 锁定（CPU，
+`python -m pytest tests/test_low_precision_quant_ref.py -x -q`）。

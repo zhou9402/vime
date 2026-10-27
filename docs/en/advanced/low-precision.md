@@ -143,3 +143,11 @@ bash scripts/low_precision/run-kimi-k2-Thinking-int4.sh
 ```
 
 For multi-node environments, start the Ray service according to your cluster configuration.
+
+## Numerics oracle for low-precision formats
+
+`vime/utils/quant_ref.py` provides pure-torch reference implementations
+(MXFP8 with UE8M0 scales, NVFP4 with E4M3 block scales, block-FP8 dequant)
+used as the deterministic oracle for all low-precision quantizers; the
+contract is pinned by `tests/test_low_precision_quant_ref.py` (CPU,
+`python -m pytest tests/test_low_precision_quant_ref.py -x -q`).
