@@ -1744,6 +1744,18 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_run_uuid_arguments(parser):
+            parser.add_argument(
+                "--run-uuid",
+                type=str,
+                default=None,
+                help=(
+                    "Run identifier: exactly 16 lowercase hex characters. "
+                    "Auto-generated in post-parse validation when unset."
+                ),
+            )
+            return parser
+
         def add_ci_arguments(parser):
             parser.add_argument(
                 "--ci-test",
@@ -1797,6 +1809,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         parser = add_agent_arguments(parser)
+        parser = add_run_uuid_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -2006,9 +2019,12 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def vime_validate_args(args):
     from vime.utils.ppo_utils import get_pg_loss_type
+    from vime.utils.run_uuid import generate_run_uuid, validate_run_uuid
     from vime.utils.score_centering import validate_score_centering_args
 
     args = copy.deepcopy(args)
+    run_uuid = getattr(args, "run_uuid", None)
+    args.run_uuid = validate_run_uuid(run_uuid) if run_uuid is not None else generate_run_uuid()
     if getattr(args, "rollout_cleanup_timeout", 60) <= 0:
         raise ValueError("--rollout-cleanup-timeout must be positive")
     get_pg_loss_type(args)
