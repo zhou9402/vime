@@ -36,7 +36,10 @@ setup(
     packages=find_packages(include=["vime*", "vime_plugins*"]),
     include_package_data=True,
     install_requires=_fetch_requirements("requirements.txt"),
-    extras_require={},
+    extras_require={
+        # Optional RDMA transport for --update-weight-transport=p2p (F01); imported lazily.
+        "p2p": ["mooncake-transfer-engine"],
+    },
     python_requires=">=3.10",
     classifiers=[
         "Programming Language :: Python :: 3.10",

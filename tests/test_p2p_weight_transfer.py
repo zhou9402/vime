@@ -33,19 +33,7 @@ import hashlib
 import pytest
 import torch
 
-def pack_bucket_into_transfer_buffer(buffer: torch.Tensor, bucket: dict[str, torch.Tensor]) -> list[dict]:
-    """NOTE: local copy for P0; F01-P2 switches this to the shipped helper in
-    vime.backends.megatron_utils.update_weight.p2p."""
-    manifest = []
-    offset = 0
-    for name, tensor in bucket.items():
-        nbytes = tensor.numel() * tensor.element_size()
-        if offset + nbytes > buffer.numel():
-            raise RuntimeError(f"bucket exceeds the transfer buffer at {name}")
-        buffer[offset : offset + nbytes].view(tensor.dtype).view(tensor.shape).copy_(tensor)
-        manifest.append({"name": name, "offset": offset, "nbytes": nbytes})
-        offset += nbytes
-    return manifest
+from vime.backends.megatron_utils.update_weight.p2p import pack_bucket_into_transfer_buffer
 
 NUM_GPUS = 0
 
