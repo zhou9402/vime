@@ -113,15 +113,34 @@ class EvalDispatcher:
 
 
 class _RayRolloutManagerEvalBridge:
-    """Awaitable facade over the RolloutManager Ray actor."""
+    """Awaitable facade over the RolloutManager Ray actor (and the EvalRunner
+    actor when a dedicated eval fleet is configured)."""
 
-    def __init__(self, rollout_manager):
+    def __init__(self, rollout_manager, eval_runner=None):
         self._actor = rollout_manager
+        self._eval_runner = eval_runner
 
-    async def eval(self, rollout_id, **kwargs):
+    async def eval(self, rollout_id, hf_dir=None, export_time_seconds=None, require_marker=False):
         import ray
 
-        return await asyncio.to_thread(ray.get, self._actor.eval.remote(rollout_id, **kwargs))
+        if hf_dir is None:
+            return await asyncio.to_thread(ray.get, self._actor.eval.remote(rollout_id))
+        if self._eval_runner is None:
+            raise RuntimeError(
+                "Snapshot eval was dispatched but no dedicated eval fleet is running; "
+                "set --eval-num-gpus or disable snapshot eval."
+            )
+        from vime.ray.eval_fleet import EvalSkip
+
+        try:
+            data, metrics = await asyncio.to_thread(
+                ray.get,
+                self._eval_runner.run.remote(rollout_id, hf_dir, str(rollout_id), require_marker),
+            )
+        except EvalSkip as e:
+            await self.report_eval_skip(rollout_id, e.reason)
+            return
+        await asyncio.to_thread(ray.get, self._actor.report_eval_result.remote(rollout_id, data, metrics))
 
     async def report_eval_skip(self, rollout_id, reason):
         import ray
@@ -175,9 +194,22 @@ class AsyncEvalThread:
 
 
 def create_eval_dispatcher(args, actor_model, rollout_manager) -> AsyncEvalThread:
+    eval_runner = None
+    if getattr(args, "eval_uses_snapshots", False):
+        import ray
+
+        from vime.ray.eval_fleet import EvalRunner
+
+        fleet = ray.get(rollout_manager.get_eval_fleet.remote())
+        if fleet is not None:
+            # Driver-owned (not detached): eval engines are not part of the
+            # recoverable serving topology in v1 and die with the driver.
+            eval_runner = EvalRunner.remote(args, fleet["engines"], fleet["router"])
+        else:
+            logger.warning("Snapshot eval requested but no eval fleet is configured; evals will be skipped.")
     dispatcher = EvalDispatcher(
         args,
         _RayTrainGroupBridge(actor_model),
-        _RayRolloutManagerEvalBridge(rollout_manager),
+        _RayRolloutManagerEvalBridge(rollout_manager, eval_runner),
     )
     return AsyncEvalThread(dispatcher)

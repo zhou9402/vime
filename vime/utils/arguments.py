@@ -921,6 +921,22 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
         def add_eval_fleet_arguments(parser):
             # Non-blocking, snapshot-based eval (port of miles eval_dispatch/eval_fleet).
             parser.add_argument(
+                "--eval-num-gpus",
+                type=int,
+                default=0,
+                help=(
+                    "Dedicated eval engine fleet size. >0 runs eval on its own engines behind their own "
+                    "router, synced by loading exported HF snapshots, never by joining training weight "
+                    "updates. 0 keeps shared-engine eval."
+                ),
+            )
+            parser.add_argument(
+                "--eval-num-gpus-per-engine",
+                type=int,
+                default=1,
+                help="GPUs per eval engine (TP size).",
+            )
+            parser.add_argument(
                 "--eval-hf-dir",
                 type=str,
                 default=None,
@@ -2133,6 +2149,15 @@ def vime_validate_args(args):
     args.eval_uses_snapshots = bool(getattr(args, "eval_num_gpus", 0))
     if getattr(args, "eval_hf_dir", None) is not None:
         assert args.eval_interval is not None, "--eval-hf-dir requires --eval-interval."
+    if getattr(args, "eval_num_gpus", 0):
+        assert args.eval_interval is not None, "--eval-num-gpus requires --eval-interval."
+        assert not args.rollout_external, "--eval-num-gpus is not supported with external rollout engines."
+        assert args.eval_num_gpus % args.eval_num_gpus_per_engine == 0, (
+            "--eval-num-gpus must be a multiple of --eval-num-gpus-per-engine."
+        )
+        assert args.eval_hf_dir is not None, (
+            "The eval fleet loads exported HF snapshots: --eval-hf-dir is required with --eval-num-gpus."
+        )
 
     if importlib.util.find_spec("straw") is None:
         if args.rollout_data_transport == "straw":

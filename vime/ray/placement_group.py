@@ -101,34 +101,51 @@ def _create_placement_group(num_gpus):
 
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
+    """Total GPU bundles and the rollout offset; eval-fleet GPUs ride at the tail.
+
+    Returns ``(num_gpus, rollout_offset)``. ``_eval_num_gpus(args)`` extra
+    bundles are appended past every other region so trainer offsets never
+    shift when the dedicated eval fleet is enabled.
+    """
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    eval_num_gpus = _eval_num_gpus(args)
 
     if args.debug_train_only:
-        return actor_num_gpus, 0
+        return actor_num_gpus + eval_num_gpus, 0
 
     if args.rollout_external:
+        assert eval_num_gpus == 0, "--eval-num-gpus is not supported with external rollout engines"
         if args.debug_rollout_only:
             return actor_num_gpus, 0
         return actor_num_gpus, actor_num_gpus
 
     if args.debug_rollout_only:
-        return args.rollout_num_gpus, 0
+        return args.rollout_num_gpus + eval_num_gpus, 0
 
     if args.colocate:
-        return max(actor_num_gpus, args.rollout_num_gpus), 0
+        # Trainer and rollout engines share the leading region; eval engines
+        # are dedicated and live in the appended tail.
+        return max(actor_num_gpus, args.rollout_num_gpus) + eval_num_gpus, 0
 
-    return actor_num_gpus + args.rollout_num_gpus, actor_num_gpus
+    return actor_num_gpus + args.rollout_num_gpus + eval_num_gpus, actor_num_gpus
+
+
+def _eval_num_gpus(args) -> int:
+    return getattr(args, "eval_num_gpus", 0) or 0
 
 
 def create_placement_groups(args):
-    """Create placement groups for actor, critic, and rollout engines."""
+    """Create placement groups for actor, critic, rollout, and eval engines."""
 
+    eval_num_gpus = _eval_num_gpus(args)
     if not args.colocate and not args.rollout_external and not args.debug_train_only and not args.debug_rollout_only:
         # Separate allocations let a restarted trainer resize without moving
         # the serving engines that still hold rollout state.
         actor_pg = _create_placement_group(args.actor_num_nodes * args.actor_num_gpus_per_node)
         try:
-            rollout_pg = _create_placement_group(args.rollout_num_gpus)
+            # Eval-fleet GPUs are appended after the rollout region; engine
+            # assignment walks the bundle list in model order (eval is last).
+            rollout_pg = _create_placement_group(args.rollout_num_gpus + eval_num_gpus)
         except BaseException:
             from ray.util.placement_group import remove_placement_group
 
@@ -141,13 +158,31 @@ def create_placement_groups(args):
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
-    rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
-    rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
 
-    result = {
-        "actor": (pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
-        "rollout": (pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
-    }
+    result = {}
+    # The actor (trainer) view excludes the appended eval tail so trainer GPU
+    # offsets never shift when the eval fleet is enabled.
+    actor_span = num_gpus - eval_num_gpus
+    result["actor"] = (
+        pg,
+        actor_pg_reordered_bundle_indices[:actor_span],
+        actor_pg_reordered_gpu_ids[:actor_span],
+    )
+    if eval_num_gpus:
+        # Rollout engines keep their original region; eval engines get the
+        # tail bundles. The concatenated list preserves allocation order.
+        rollout_bundles = (
+            actor_pg_reordered_bundle_indices[rollout_offset : rollout_offset + args.rollout_num_gpus]
+            + actor_pg_reordered_bundle_indices[-eval_num_gpus:]
+        )
+        rollout_gpus = (
+            actor_pg_reordered_gpu_ids[rollout_offset : rollout_offset + args.rollout_num_gpus]
+            + actor_pg_reordered_gpu_ids[-eval_num_gpus:]
+        )
+    else:
+        rollout_bundles = actor_pg_reordered_bundle_indices[rollout_offset:]
+        rollout_gpus = actor_pg_reordered_gpu_ids[rollout_offset:]
+    result["rollout"] = (pg, rollout_bundles, rollout_gpus)
 
     result["critic"] = result["actor"] if args.use_critic else None
 

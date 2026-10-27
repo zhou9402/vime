@@ -422,6 +422,30 @@ class RolloutManager:
         if getattr(self.args, "ci_test", False):
             raise RuntimeError(f"eval point {rollout_id} skipped under --ci-test: {reason}")
 
+    def get_eval_fleet(self):
+        """Eval engine handles + router for the dedicated fleet, or None."""
+        from vime.ray.eval_fleet import EVAL_MODEL_NAME
+
+        server = self.servers.get(EVAL_MODEL_NAME) if self.servers else None
+        if server is None:
+            return None
+        return {
+            "engines": list(server.engines),
+            "router": (server.router_ip, server.router_port),
+            "engine_gpu_counts": list(server.engine_gpu_counts),
+        }
+
+    def report_eval_result(self, rollout_id, data, metrics):
+        """Log a fleet-produced eval result through the manager's tracking."""
+        save_debug_rollout_data(
+            self.args.save_debug_rollout_data,
+            data,
+            rollout_id=rollout_id,
+            evaluation=True,
+            args=self.args,
+        )
+        log_eval_rollout_data(rollout_id, self.args, data, metrics)
+
     def save(self, rollout_id):
         # Keep admission frozen across source and builder snapshots. Source.save
         # preserves this pre-existing pause instead of resuming between files.

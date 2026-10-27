@@ -217,24 +217,45 @@ class VllmConfig:
 
 def resolve_vllm_config(args) -> VllmConfig:
     """Resolve the configured, legacy PD, or default vLLM deployment."""
+    eval_num_gpus = getattr(args, "eval_num_gpus", 0)
     if getattr(args, "vllm_config", None) is not None:
         config = VllmConfig.from_yaml(args.vllm_config)
-        expected = args.rollout_num_gpus
+        expected = args.rollout_num_gpus + eval_num_gpus
         actual = config.total_num_gpus
-        assert actual == expected, f"vllm_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
+        assert actual == expected, f"vllm_config total GPUs ({actual}) != rollout_num_gpus + eval_num_gpus ({expected})"
+        if eval_num_gpus > 0:
+            eval_models = [m for m in config.models if m.name == "eval"]
+            assert len(eval_models) == 1, (
+                "With --eval-num-gpus > 0, --vllm-config must contain exactly one model named 'eval' "
+                f"totalling {eval_num_gpus} GPUs."
+            )
+            assert eval_models[0].total_num_gpus == eval_num_gpus
         return config
 
-    if args.rollout_num_gpus == 0:
+    if args.rollout_num_gpus == 0 and eval_num_gpus == 0:
         return VllmConfig(models=[ModelConfig(name="default", server_groups=[])])
 
     if args.prefill_num_servers is not None:
+        assert eval_num_gpus == 0, "--eval-num-gpus is not supported with --prefill-num-servers"
         return VllmConfig.from_prefill_num_servers(args)
 
-    return VllmConfig(
-        models=[
+    models = []
+    if args.rollout_num_gpus > 0:
+        models.append(
             ModelConfig(
                 name="default",
                 server_groups=[ServerGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
             )
-        ]
-    )
+        )
+    if eval_num_gpus > 0:
+        # The eval fleet loads weights exclusively from exported HF snapshots
+        # (update_weights=False) so it never joins the training weight sync.
+        models.append(
+            ModelConfig(
+                name="eval",
+                num_gpus_per_engine=args.eval_num_gpus_per_engine,
+                server_groups=[ServerGroupConfig(worker_type="regular", num_gpus=eval_num_gpus)],
+                update_weights=False,
+            )
+        )
+    return VllmConfig(models=models)
