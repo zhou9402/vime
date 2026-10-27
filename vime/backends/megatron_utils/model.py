@@ -296,6 +296,12 @@ def setup_model_and_optimizer(
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
+    # Params marked with mark_param_dtype (e.g. KDA fp32 norms) are re-cast after
+    # Float16Module wrapping; no-op when no model marks anything.
+    from vime.backends.megatron_utils.fp32_param_utils import enforce_marked_param_dtypes
+
+    enforce_marked_param_dtypes(model)
+
     if args.num_rollout == 0:
         args.no_load_optim = True
         return model, None, None
