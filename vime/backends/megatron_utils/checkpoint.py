@@ -95,6 +95,14 @@ logger = logging.getLogger(__name__)
 __all__ = ["save_checkpoint"]
 
 
+def _is_lora_model(model) -> bool:
+    """Whether the model chunks were built with LoRA adapters (flag set at build, all ranks agree)."""
+    try:
+        return bool(model[0].lora_attached)
+    except (AttributeError, IndexError, TypeError):
+        return False
+
+
 @contextmanager
 def _stage_async_save_on_cpu():
     from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
@@ -119,6 +127,38 @@ def _stage_async_save_on_cpu():
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, **kwargs):
     args = get_args()
+    if _is_lora_model(model):
+        # LoRA training never re-saves the frozen base: the adapter (plus its
+        # optimizer/scheduler state) lands in the iteration dir as adapter/.
+        # The Megatron tracker file is left untouched (a base save may predate
+        # or follow adapter saves); LoRA progress is tracked separately so a
+        # resume with --load == --save still loads the base checkpoint Megatron
+        # expects. Resume = --load <base> --lora-adapter-path <iter_dir>/adapter,
+        # or just --save <dir> (auto-resolved from latest_lora_iteration.txt).
+        from vime.backends.megatron_utils.lora.utils import save_lora_checkpoint
+
+        # Callers pass Megatron-save kwargs (num_floating_point_operations_so_far,
+        # checkpointing_context, train_data_iterator, preprocess_common_state_dict_fn).
+        # None apply to the adapter-only format: the data-iterator state and FLOPs
+        # counter resume from the base checkpoint at --load, not from the adapter.
+        ignored = {k: v for k, v in kwargs.items() if v is not None}
+        if ignored:
+            logger.warning("LoRA adapter-only save ignores Megatron save kwargs: %s", sorted(ignored))
+        save_lora_checkpoint(
+            model,
+            args,
+            str(Path(args.save) / f"iter_{iteration:07d}" / "adapter"),
+            optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
+            iteration=iteration,
+        )
+        if dist.get_rank() == 0:
+            tracker = Path(args.save) / "latest_lora_iteration.txt"
+            tracker.parent.mkdir(parents=True, exist_ok=True)
+            temporary = tracker.with_suffix(".tmp")
+            temporary.write_text(f"{iteration}\n")
+            temporary.replace(tracker)
+        return
     stage_on_cpu = args.async_save and args.offload_train and getattr(args, "async_strategy", "mcore") == "mcore"
     with _stage_async_save_on_cpu() if stage_on_cpu else nullcontext():
         _save_checkpoint_megatron(iteration, model, optimizer, opt_param_scheduler, **kwargs)
