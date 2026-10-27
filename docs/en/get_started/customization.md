@@ -252,6 +252,16 @@ def filter_function(args, samples: list[Sample]) -> None
 - Filtering samples based on response quality
 - Implementing selective training strategies
 
+**Built-in filters** (`vime/rollout/filter_hub/`):
+- `vime.rollout.filter_hub.sample_filters.mask_truncated_zero_reward` — DeepSWE compact filtering:
+  cut-off trajectories (`Status.TRUNCATED`, or agent `exit_status` of `TimeLimitExceeded` /
+  `SequenceLengthLimitExceeded`) with zero/missing reward are left out of the loss.
+- `vime.rollout.filter_hub.common_filters.apply_aborted_filter` / `apply_missing_reward_filter` —
+  group-level filters composable ahead of a dynamic filter via `apply_preput_filters`. A ready-to-use
+  composition is available with no custom code:
+  `--dynamic-sampling-filter-path vime.rollout.filter_hub.common_filters.preput_then_reward_nonzero_std`
+  (drops aborted and missing-reward groups, then applies the reward-nonzero-std dynamic filter).
+
 ---
 
 ### `--rollout-all-samples-process-path`

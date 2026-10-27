@@ -237,6 +237,15 @@ def filter_function(args, samples: list[Sample]) -> None
 - 基于响应质量过滤样本
 - 实现选择性训练策略
 
+**内置过滤器**（`vime/rollout/filter_hub/`）：
+- `vime.rollout.filter_hub.sample_filters.mask_truncated_zero_reward` — DeepSWE 紧凑过滤：
+  被截断的轨迹（`Status.TRUNCATED`，或 agent `exit_status` 为 `TimeLimitExceeded` /
+  `SequenceLengthLimitExceeded`）且 reward 为零/缺失时，从损失中剔除。
+- `vime.rollout.filter_hub.common_filters.apply_aborted_filter` / `apply_missing_reward_filter` —
+  组级过滤器，可通过 `apply_preput_filters` 组合在动态过滤器之前。无需写代码即可直接使用：
+  `--dynamic-sampling-filter-path vime.rollout.filter_hub.common_filters.preput_then_reward_nonzero_std`
+  （先丢弃 aborted / reward 缺失的组，再执行 reward 方差非零的动态过滤）。
+
 ---
 
 ### `--rollout-all-samples-process-path`
