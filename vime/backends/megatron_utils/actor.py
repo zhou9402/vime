@@ -36,6 +36,13 @@ from vime.utils.types import RolloutBatch
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import prepare_routed_experts_for_routing_replay, slice_log_prob_with_cp
+
+def _indexer_replay_set_stage(stage: str) -> None:
+    """Set the IndexerReplayManager stage; harmless when disabled (F07-8b)."""
+    from vime.utils.replay_base import indexer_replay_manager
+
+    indexer_replay_manager.stage = stage
+
 from .data import DataIterator, get_data_iterator
 from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
@@ -450,12 +457,17 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
+        if getattr(self.args, "use_rollout_indexer_replay", False):
+            from vime.backends.megatron_utils.indexer_replay import fill_indexer_replay
+
+            fill_indexer_replay(self.args, data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                        _indexer_replay_set_stage("fallthrough")
                     self._switch_model("ref")
                     rollout_data.update(
                         self.compute_log_prob(
@@ -470,6 +482,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                        _indexer_replay_set_stage("fallthrough")
                     self._switch_model("teacher")
                     rollout_data.update(
                         self.compute_log_prob(
@@ -497,9 +510,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                            _indexer_replay_set_stage("replay_forward")
                             RoutingReplay.begin_lazy_pass("forward")
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                            _indexer_replay_set_stage("record")
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -536,6 +551,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+                _indexer_replay_set_stage("replay_backward")
                 if self.args.use_rollout_routing_replay:
                     # Hold each microbatch across forward and recompute; release
                     # it after the backward replay has consumed every layer.

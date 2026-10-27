@@ -102,6 +102,10 @@ class RayTrainGroup:
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
+        # Indexer replay registers per-layer queues at model build time.
+        if getattr(self.args, "use_rollout_indexer_replay", False) and self.role == "actor":
+            env_vars["VIME_ENABLE_INDEXER_REPLAY"] = "1"
+
         if self._actor_cls is None:
             from vime.backends.megatron_utils.actor import MegatronTrainRayActor
 

@@ -27,3 +27,7 @@ vime 将 miles 的 day-0 模型覆盖移植为 Megatron 训练侧插件，位于
 （`[rows, num_streams, index_topk]` int32，rows = `tokens[1:]`），供训练侧的
 `IndexerReplayManager`（`vime/utils/replay_base.py`）使用。ROCm 镜像尚未包含该 vLLM patch
 （需要针对 ROCm nightly base 做 rebase）。
+
+训练侧：`vime/backends/megatron_utils/indexer_replay.py` 按 microbatch 顺序填充逐层回放队列
+（THD token 位置重定基、zigzag CP、SP 切片）。当前限制：不支持磁盘驻留（TensorRef）的
+indexer 负载，也不支持 allgather_cp；两者都会显式报错。

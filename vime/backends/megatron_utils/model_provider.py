@@ -300,6 +300,15 @@ def wrap_model_provider_with_freeze(original_provider, args):
             if key in sig.parameters:
                 provider_kwargs[key] = kwargs.get(key, None)
 
+        import os
+
+        if os.environ.get("VIME_ENABLE_INDEXER_REPLAY", "0") == "1":
+            # Enable before the provider builds modules so the DSv4 indexers
+            # register their replay queues in __init__.
+            from vime.utils.replay_base import indexer_replay_manager
+
+            indexer_replay_manager.enabled = True
+
         model = original_provider(**provider_kwargs)
         from vime.utils.routing_replay import register_routing_replay
 

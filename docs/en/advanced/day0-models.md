@@ -27,3 +27,7 @@ per-token indexer top-k indices as a base64 `.npy` blob on the generate choice; 
 them onto `Sample.rollout_indexer_topk` (`[rows, num_streams, index_topk]` int32, rows =
 `tokens[1:]`) for the trainer-side `IndexerReplayManager` (`vime/utils/replay_base.py`).
 ROCm images do not carry the vLLM patch yet (needs a rebase against the ROCm nightly base).
+
+Trainer-side: `vime/backends/megatron_utils/indexer_replay.py` fills the per-layer replay
+queues in microbatch order (THD token-position rebase, zigzag CP, SP slicing). Current limits:
+no disk-backed (TensorRef) indexer payloads and no allgather_cp yet; both raise loudly.
