@@ -427,6 +427,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
                 f"expected {len(sample.tokens) - 1}"
             )
         inference_sampling_params["routed_experts_prompt_start"] = routed_experts_start
+    indexer_topk_start = 0
+    if getattr(args, "use_rollout_indexer_replay", False) and sample.response_length:
+        indexer_topk_start = sample.get_rollout_indexer_topk_length()
+        if indexer_topk_start != len(sample.tokens) - 1:
+            raise ValueError(
+                f"Indexer-replay continuation {sample.index} has {indexer_topk_start} rows, "
+                f"expected {len(sample.tokens) - 1}"
+            )
 
     messages = build_multimodal_messages(sample.prompt, sample.multimodal_inputs)
 
@@ -479,6 +487,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     meta_info = _inference_generate_meta_info(output)
     if routed_experts_start:
         meta_info["routed_experts_start_len"] = routed_experts_start
+    if indexer_topk_start:
+        meta_info["indexer_topk_start_len"] = indexer_topk_start
     if score_centering:
         score_metadata, normalized_logprobs = _score_centering_metadata(
             choice,
@@ -547,6 +557,12 @@ def _inference_generate_meta_info(output: dict[str, Any]) -> dict[str, Any]:
     if routed_experts is not None:
         raw = base64.b64decode(routed_experts.encode("ascii"), validate=True)
         meta["routed_experts"] = np.load(io.BytesIO(raw), allow_pickle=False)
+
+    # DSA indexer top-k replay: vLLM ships indexer_topk as a base64 .npy blob on the choice.
+    indexer_topk = choice.get("indexer_topk")
+    if indexer_topk is not None:
+        raw = base64.b64decode(indexer_topk.encode("ascii"), validate=True)
+        meta["indexer_topk"] = np.load(io.BytesIO(raw), allow_pickle=False)
 
     sampling_mask = choice.get("sampling_mask")
     if sampling_mask is not None:

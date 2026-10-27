@@ -1,0 +1,572 @@
+diff --git a/vllm/config/aux_output.py b/vllm/config/aux_output.py
+index f70f57e70f..11fea46961 100644
+--- a/vllm/config/aux_output.py
++++ b/vllm/config/aux_output.py
+@@ -14,18 +14,24 @@ class AuxOutputConfig:
+     enable_return_routed_experts: bool = False
+     """Capture and return routed-experts auxiliary outputs."""
+ 
++    enable_return_indexer_topk: bool = False
++    """Capture and return per-token DSA indexer top-k indices (RL replay)."""
++
+     max_bytes: int | None = Field(default=None, gt=0)
+     """LRU capacity, or ``None`` to derive it from the KV cache capacity."""
+ 
+     @property
+     def enabled(self) -> bool:
+         """Whether any execution auxiliary output is enabled."""
+-        return self.enable_return_routed_experts
++        return self.enable_return_routed_experts or self.enable_return_indexer_topk
+ 
+     def compute_hash(self) -> str:
+         """Hash AuxOutput settings that alter the model forward graph."""
+         from vllm.config.utils import hash_factors
+ 
+         return hash_factors(
+-            {"enable_return_routed_experts": self.enable_return_routed_experts}
++            {
++                "enable_return_routed_experts": self.enable_return_routed_experts,
++                "enable_return_indexer_topk": self.enable_return_indexer_topk,
++            }
+         )
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 08ecfaadb8..d2f73c2f24 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -469,6 +469,7 @@ class EngineArgs:
+     # Public compatibility argument. Canonical runtime state lives in
+     # AuxOutputConfig.
+     enable_return_routed_experts: bool = False
++    enable_return_indexer_topk: bool = AuxOutputConfig.enable_return_indexer_topk
+     return_sampling_mask: bool = ModelConfig.return_sampling_mask
+     return_sampling_mask_logprobs: bool = ModelConfig.return_sampling_mask_logprobs
+     model_weights: str = ModelConfig.model_weights
+@@ -862,6 +863,8 @@ class EngineArgs:
+             self.aux_output_config = AuxOutputConfig(**self.aux_output_config)
+         if self.enable_return_routed_experts:
+             self.aux_output_config.enable_return_routed_experts = True
++        if self.enable_return_indexer_topk:
++            self.aux_output_config.enable_return_indexer_topk = True
+         if isinstance(self.engram_config, dict):
+             self.engram_config = EngramConfig(**self.engram_config)
+         if isinstance(self.mamba_config, dict):
+@@ -972,6 +975,10 @@ class EngineArgs:
+             "--enable-return-routed-experts",
+             **aux_output_kwargs["enable_return_routed_experts"],
+         )
++        model_group.add_argument(
++            "--enable-return-indexer-topk",
++            **aux_output_kwargs["enable_return_indexer_topk"],
++        )
+         model_group.add_argument(
+             "--return-sampling-mask",
+             **model_kwargs["return_sampling_mask"],
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index bb39e2bbd5..416ce56e94 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -141,6 +141,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
+             disable CUDA graph and always execute the model in eager mode.
+             If False, we will use CUDA graph and eager execution in hybrid.
+         enable_return_routed_experts: Whether to return routed experts.
++        enable_return_indexer_topk: Whether to return per-token DSA indexer
++            top-k indices (RL replay).
+         disable_custom_all_reduce: See
+             [ParallelConfig][vllm.config.ParallelConfig].
+         hf_token: The token to use as HTTP bearer authorization for remote files
+@@ -204,6 +206,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
+         offload_params: set[str] | None = None,
+         enforce_eager: bool = False,
+         enable_return_routed_experts: bool = False,
++        enable_return_indexer_topk: bool = False,
+         return_sampling_mask: bool = False,
+         disable_custom_all_reduce: bool = False,
+         hf_token: bool | str | None = None,
+@@ -320,6 +323,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
+             offload_params=offload_params or set(),
+             enforce_eager=enforce_eager,
+             enable_return_routed_experts=enable_return_routed_experts,
++            enable_return_indexer_topk=enable_return_indexer_topk,
+             return_sampling_mask=return_sampling_mask,
+             disable_custom_all_reduce=disable_custom_all_reduce,
+             hf_token=hf_token,
+diff --git a/vllm/entrypoints/scale_out/token_in_token_out/protocol.py b/vllm/entrypoints/scale_out/token_in_token_out/protocol.py
+index 2909d66416..528919fc27 100644
+--- a/vllm/entrypoints/scale_out/token_in_token_out/protocol.py
++++ b/vllm/entrypoints/scale_out/token_in_token_out/protocol.py
+@@ -410,6 +410,11 @@ class GenerateChoiceBase(BaseModel):
+     # `None` if (a) the request was aborted before any forward pass,
+     # or (b) `enable_return_routed_experts` is off server-side.
+     routed_experts: str | None = None
++    # Per-token DSA indexer top-k indices, base64-encoded `.npy` bytes.
++    # Shape after decode: (num_rows, num_indexer_layers, index_topk) int32;
++    # rows are per scheduled query position with the spec-decode-rejected
++    # suffix dropped. `None` unless `enable_return_indexer_topk` is on.
++    indexer_topk: str | None = None
+     sampling_mask: list[list[int]] | None = None
+     sampling_mask_logprobs: list[list[float]] | None = None
+ 
+@@ -443,6 +448,7 @@ class GenerateStreamChoiceBase(BaseModel):
+     finish_reason: str | None = None
+     token_ids: list[int] | None = None
+     routed_experts: str | None = None
++    indexer_topk: str | None = None
+     sampling_mask: list[list[int]] | None = None
+     sampling_mask_logprobs: list[list[float]] | None = None
+ 
+diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
+index 952f6ce742..95d598c4b5 100644
+--- a/vllm/entrypoints/scale_out/token_in_token_out/serving.py
++++ b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
+@@ -444,6 +444,11 @@ class ServingTokens(GenerateBaseServing):
+                 if output.routed_experts is not None
+                 else None
+             )
++            indexer_topk_b64 = (
++                numpy2base64(output.indexer_topk)
++                if output.indexer_topk is not None
++                else None
++            )
+ 
+             sampling_mask = None
+             sampling_mask_logprobs = None
+@@ -457,6 +462,7 @@ class ServingTokens(GenerateBaseServing):
+                 finish_reason=output.finish_reason if output.finish_reason else "stop",
+                 token_ids=as_list(output.token_ids),
+                 routed_experts=routed_experts_b64,
++                indexer_topk=indexer_topk_b64,
+                 sampling_mask=sampling_mask,
+                 sampling_mask_logprobs=sampling_mask_logprobs,
+             )
+@@ -642,6 +648,11 @@ class ServingTokens(GenerateBaseServing):
+                         if output.routed_experts is not None
+                         else None
+                     )
++                    indexer_topk_b64 = (
++                        numpy2base64(output.indexer_topk)
++                        if output.indexer_topk is not None
++                        else None
++                    )
+ 
+                     sampling_mask = None
+                     if output.sampling_mask is not None:
+@@ -652,6 +663,7 @@ class ServingTokens(GenerateBaseServing):
+                         finish_reason=finish_reason,
+                         token_ids=as_list(delta_token_ids),
+                         routed_experts=routed_experts_b64,
++                        indexer_topk=indexer_topk_b64,
+                         sampling_mask=sampling_mask,
+                         sampling_mask_logprobs=(
+                             output.sampling_mask.logprobs
+diff --git a/vllm/model_executor/layers/indexer_topk_capturer.py b/vllm/model_executor/layers/indexer_topk_capturer.py
+new file mode 100644
+index 0000000000..e07589bc04
+--- /dev/null
++++ b/vllm/model_executor/layers/indexer_topk_capturer.py
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Capture per-token DSA indexer top-k indices for RL rollout replay (R3).
++
++The DSA indexer layers (``SparseAttnIndexer``) share a single reusable
++``topk_indices_buffer`` that every layer overwrites in turn, so a per-layer
++record requires copying each layer's indices right after its forward. The
++capturer owns a ``(max_num_batched_tokens, num_indexer_layers, index_topk)``
++int32 buffer; each bound indexer copies its rows into its own slot.
++
++TP note: indexer top-k is deterministic given the same KV pages, so the buffer
++is captured identically on every TP rank and only the executor output rank's
++copy is consumed downstream.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from functools import partial
++
++import numpy as np
++import torch
++
++from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
++
++
++class IndexerTopkCapturer:
++    def __init__(
++        self,
++        max_num_batched_tokens: int,
++        num_indexer_layers: int,
++        index_topk: int,
++        device: torch.device,
++    ) -> None:
++        self.num_indexer_layers = num_indexer_layers
++        self.index_topk = index_topk
++        self.buffer = torch.full(
++            (max_num_batched_tokens, num_indexer_layers, index_topk),
++            -1,
++            dtype=torch.int32,
++            device=device,
++        )
++
++    def capture(self, slot: int, num_tokens: int, topk_indices_buffer: torch.Tensor) -> None:
++        self.buffer[:num_tokens, slot].copy_(topk_indices_buffer[:num_tokens])
++
++
++def bind_indexer_topk_capturer(
++    model: torch.nn.Module, max_num_batched_tokens: int, index_topk: int
++) -> IndexerTopkCapturer:
++    """Assign one buffer slot per SparseAttnIndexer layer, in module order."""
++    indexer_modules = [m for m in model.modules() if isinstance(m, SparseAttnIndexer)]
++    if not indexer_modules:
++        raise RuntimeError(
++            "enable_return_indexer_topk is set but the model has no SparseAttnIndexer layers"
++        )
++    capturer = IndexerTopkCapturer(
++        max_num_batched_tokens=max_num_batched_tokens,
++        num_indexer_layers=len(indexer_modules),
++        index_topk=index_topk,
++        device=indexer_modules[0].topk_indices_buffer.device,
++    )
++    for slot, module in enumerate(indexer_modules):
++        module._indexer_topk_capture = partial(capturer.capture, slot)
++    return capturer
++
++
++@dataclass
++class PendingIndexerTopk:
++    """Own one step's indexer top-k GPU snapshot until its async D2H copy lands."""
++
++    capturer: IndexerTopkCapturer
++    request_ids: list[str]
++    query_start_loc: np.ndarray
++    gpu_slice: torch.Tensor  # view of capturer.buffer[:num_rows]
++    rows: np.ndarray | None = None
++    num_rejected: np.ndarray | None = None
++
++    def enqueue_cpu_copy(self, num_rejected: np.ndarray) -> None:
++        """Enqueue asynchronous D2H copies; call on the output copy stream."""
++        self.num_rejected = num_rejected
++        self.rows = self.gpu_slice.to("cpu", non_blocking=True).numpy()
++
++    def process_output(self) -> dict[str, np.ndarray]:
++        """Per-request rows with the spec-decode-rejected suffix dropped."""
++        assert self.rows is not None and self.num_rejected is not None
++        out: dict[str, np.ndarray] = {}
++        for i, request_id in enumerate(self.request_ids):
++            start, end = int(self.query_start_loc[i]), int(self.query_start_loc[i + 1])
++            keep = max(end - start - int(self.num_rejected[i]), 0)
++            out[request_id] = self.rows[start : start + keep]
++        return out
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index f8fedf046a..dcd4b928fa 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -946,6 +946,13 @@ class SparseAttnIndexer(CustomOp):
+             return value
+         return self._cp_kv_cache_interleave_size
+ 
++    def _capture_indexer_topk(self, hidden_states: torch.Tensor) -> None:
++        # Set by bind_indexer_topk_capturer when enable_return_indexer_topk is on.
++        capture_fn = getattr(self, "_indexer_topk_capture", None)
++        if capture_fn is not None:
++            capture_fn(hidden_states.shape[0], self.topk_indices_buffer)
++
++
+     def forward_native(
+         self,
+         hidden_states: torch.Tensor,
+@@ -982,7 +989,7 @@ class SparseAttnIndexer(CustomOp):
+             q_values, q_scale = q_quant
+         else:
+             q_values, q_scale = q_quant, None
+-        return torch.ops.vllm.sparse_attn_indexer(
++        result = torch.ops.vllm.sparse_attn_indexer(
+             hidden_states,
+             _encode_layer_name(self.k_cache.prefix),
+             self.k_cache.kv_cache,
+@@ -1012,6 +1019,9 @@ class SparseAttnIndexer(CustomOp):
+             topk_backend=self.topk_backend,
+         )
+ 
++        self._capture_indexer_topk(hidden_states)
++        return result
++
+     def forward_xpu(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1043,7 +1053,7 @@ class SparseAttnIndexer(CustomOp):
+             # by local Triton/C++ kernels and do not require the aiter package.
+             or on_gfx950()
+         ):
+-            return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
++            result = torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
+                 hidden_states,
+                 _encode_layer_name(self.k_cache.prefix),
+                 self.k_cache.kv_cache,
+@@ -1063,6 +1073,9 @@ class SparseAttnIndexer(CustomOp):
+                 candidate_block_size=self.candidate_block_size,
+                 candidate_write=self.candidate_write,
+             )
++
++            self._capture_indexer_topk(hidden_states)
++            return result
+         raise RuntimeError(
+             "Sparse attention indexer ROCm path requires AITER or a supported "
+             "native architecture (gfx950/gfx11)."
+@@ -1259,4 +1272,5 @@ class SparseAttnIndexer(CustomOp):
+                     topk_indices_buffer[:num_decode_tokens, :topk_tokens],
+                 )
+ 
++        self._capture_indexer_topk(hidden_states)
+         return topk_indices_buffer
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index da96ec7548..7c9c55f383 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -72,6 +72,9 @@ class CompletionOutput:
+     cumulative_logprob: float | None
+     logprobs: SampleLogprobs | None
+     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
++    # [seq_len, num_indexer_layers, index_topk] int32; None unless
++    # enable_return_indexer_topk is on.
++    indexer_topk: np.ndarray | None = None
+     finish_reason: str | None = None
+     stop_reason: int | str | None = None
+     lora_request: LoRARequest | None = None
+@@ -234,6 +237,8 @@ class RequestOutput:
+                         # aggregation with earlier chunks that have no R3.
+                         if next_completion.routed_experts is not None:
+                             completion.routed_experts = next_completion.routed_experts
++                        if next_completion.indexer_topk is not None:
++                            completion.indexer_topk = next_completion.indexer_topk
+                         completion.finish_reason = next_completion.finish_reason
+                         completion.stop_reason = next_completion.stop_reason
+                     else:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3a15e82298..46d6b0e285 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -402,7 +402,7 @@ class Scheduler(SchedulerInterface):
+ 
+         self.aux_output_connector = (
+             AuxOutputSchedulerConnector()
+-            if vllm_config.aux_output_config.enabled
++            if vllm_config.aux_output_config.enable_return_routed_experts
+             else None
+         )
+         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
+@@ -2209,6 +2209,9 @@ class Scheduler(SchedulerInterface):
+                 stopped = True
+ 
+             routed_experts = None
++            indexer_topk = None
++            if model_runner_output.indexer_topk is not None:
++                indexer_topk = model_runner_output.indexer_topk.get(request.request_id)
+             should_emit_output = bool(
+                 new_token_ids or pooler_output is not None or stopped
+             )
+@@ -2299,6 +2302,7 @@ class Scheduler(SchedulerInterface):
+                         kv_transfer_metrics=request.kv_transfer_metrics or None,
+                         trace_headers=request.trace_headers,
+                         routed_experts=routed_experts,
++                        indexer_topk=indexer_topk,
+                         num_nans_in_logits=request.num_nans_in_logits,
+                     )
+                 )
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index 390fd5c5af..b4d9c3d03f 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -238,10 +238,15 @@ class EngineCoreOutput(
+ 
+     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
+     prompt_token_id_logprobs: torch.Tensor | None = None
++
+     weight_version: str | None = None
+     remote_kv_wait_time: float | None = None
+     kv_transfer_metrics: dict[str, float] | None = None
+ 
++    # Per-token DSA indexer top-k rows [rows, num_indexer_layers, index_topk] int32.
++    # Appended last so `array_like` positional serialization stays compatible.
++    indexer_topk: np.ndarray | None = None
++
+     @property
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index ebf71e4b79..4fa48f8e83 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -192,6 +192,7 @@ class RequestState:
+ 
+         # Routed experts accumulation (prompt + sample chunks)
+         self.routed_experts_chunks: list[np.ndarray] = []
++        self.indexer_topk_chunks: list[np.ndarray] = []
+         self.sampling_mask_chunks: list[SamplingMaskLists] = []
+ 
+         # Stream Interval
+@@ -477,12 +478,16 @@ class RequestState:
+         routed_experts = None
+         if finished and self.routed_experts_chunks:
+             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
++        indexer_topk = None
++        if finished and self.indexer_topk_chunks:
++            indexer_topk = np.concatenate(self.indexer_topk_chunks, axis=0)
+ 
+         return CompletionOutput(
+             index=self.request_index,
+             text=text,
+             token_ids=token_ids,
+             routed_experts=routed_experts,
++            indexer_topk=indexer_topk,
+             sampling_mask=sampling_mask,
+             logprobs=logprobs,
+             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
+@@ -750,6 +755,8 @@ class OutputProcessor:
+                 req_state.routed_experts_chunks.append(
+                     engine_core_output.routed_experts
+                 )
++            if engine_core_output.indexer_topk is not None:
++                req_state.indexer_topk_chunks.append(engine_core_output.indexer_topk)
+ 
+             if req_state.is_prefilling:
+                 if engine_core_output.prefill_stats is not None:
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 8764a495a9..0b84b0db64 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -317,6 +317,11 @@ class ModelRunnerOutput:
+ 
+     aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
+ 
++    # Per-request DSA indexer top-k rows for this step
++    # ([rows, num_indexer_layers, index_topk] int32), spec-rejected suffix dropped.
++    # ``None`` when ``enable_return_indexer_topk`` is off.
++    indexer_topk: dict[str, np.ndarray] | None = None
++
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
+ 
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 647b0c297c..637c159527 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -21,6 +21,9 @@ from vllm.v1.worker.utils import raise_if_nan_logits
+ 
+ if TYPE_CHECKING:
+     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
++    from vllm.model_executor.layers.indexer_topk_capturer import (
++        PendingIndexerTopk,
++    )
+     from vllm.v1.worker.gpu.input_batch import InputBatch
+ 
+ 
+@@ -122,6 +125,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         copy_stream: torch.cuda.Stream,
+         check_ep_fault: bool,
+         pending_aux_output: "PendingAuxOutput | None",
++        pending_indexer_topk: "PendingIndexerTopk | None" = None,
+     ):
+         # NOTE(woosuk): We must retain references to the GPU tensors,
+         # as the copy operations are performed on a different CUDA stream than
+@@ -130,6 +134,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         self.sampler_output = sampler_output
+         self.num_sampled_tokens = num_sampled_tokens
+         self.pending_aux_output = pending_aux_output
++        self.pending_indexer_topk = pending_indexer_topk
+         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+         self.copy_event = torch.cuda.Event(blocking=True)
+         self._has_fault: torch.Tensor | None = None
+@@ -165,6 +170,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
+                     num_sampled=self.num_sampled_tokens_np,
+                     num_rejected=async_copy_to_np(sampler_output.num_rejected),
+                 )
++            if self.pending_indexer_topk is not None:
++                self.pending_indexer_topk.enqueue_cpu_copy(
++                    async_copy_to_np(sampler_output.num_rejected)
++                )
+             if check_ep_fault:
+                 has_fault = get_ep_all2all_manager().query_fault()
+                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+@@ -205,6 +214,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             self.model_runner_output.aux_output_connector_output = (
+                 self.pending_aux_output.process_output()
+             )
++        if self.pending_indexer_topk is not None:
++            self.model_runner_output.indexer_topk = (
++                self.pending_indexer_topk.process_output()
++            )
+ 
+         if self._has_fault is not None and self._has_fault.item():
+             mask = get_ep_all2all_manager().query_active_mask()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index de417540d7..7865f842a0 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -34,6 +34,11 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.compilation.wrapper import compile_model_with_stock_torch
+ from vllm.config import VllmConfig, set_current_vllm_config
+ from vllm.config.compilation import CompilationMode, CUDAGraphMode
++from vllm.model_executor.layers.indexer_topk_capturer import (
++    IndexerTopkCapturer,
++    PendingIndexerTopk,
++    bind_indexer_topk_capturer,
++)
+ from vllm.distributed.aux_output_connector.worker import (
+     AuxOutputWorkerConnector,
+     get_aux_output_connector,
+@@ -354,6 +359,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.eplb = EPLBController(self.parallel_config, self.device)
+         # The AuxOutput Connector owns R3 capture, copying, and storage.
+         self.aux_output_connector: AuxOutputWorkerConnector | None = None
++        self.indexer_topk_capturer: IndexerTopkCapturer | None = None
+ 
+         set_offloader(create_offloader(self.vllm_config.offload_config))
+ 
+@@ -793,10 +799,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+ 
+             # AuxOutput connector requires resolved kv_cache_config.
+-            if self.vllm_config.aux_output_config.enabled:
++            if self.vllm_config.aux_output_config.enable_return_routed_experts:
+                 self.aux_output_connector = get_aux_output_connector(
+                     self.model, self.vllm_config, kv_cache_config
+                 )
++            if self.vllm_config.aux_output_config.enable_return_indexer_topk:
++                self.indexer_topk_capturer = bind_indexer_topk_capturer(
++                    self.model,
++                    max_num_batched_tokens=(
++                        self.scheduler_config.max_num_batched_tokens
++                    ),
++                    index_topk=self.model_config.hf_config.index_topk,
++                )
+ 
+     def _init_kv_zero_meta(self) -> None:
+         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+@@ -2203,6 +2217,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         pending_aux_output = None
+         if self.aux_output_connector is not None:
+             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
++        pending_indexer_topk = None
++        if self.indexer_topk_capturer is not None:
++            num_rows = int(input_batch.query_start_loc_np[len(input_batch.req_ids)])
++            pending_indexer_topk = PendingIndexerTopk(
++                capturer=self.indexer_topk_capturer,
++                request_ids=list(input_batch.req_ids),
++                query_start_loc=input_batch.query_start_loc_np[
++                    : len(input_batch.req_ids) + 1
++                ],
++                # D2D snapshot on the main stream: the shared buffer is reused by
++                # the next step before the async D2H copy runs.
++                gpu_slice=self.indexer_topk_capturer.buffer[:num_rows].clone(),
++            )
+ 
+         # Start async output copy here so that it can overlap with speculator proposal.
+         async_output = AsyncOutput(
+@@ -2213,6 +2240,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             copy_stream=self.output_copy_stream,
+             check_ep_fault=self.check_ep_fault,
+             pending_aux_output=pending_aux_output,
++            pending_indexer_topk=pending_indexer_topk,
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None

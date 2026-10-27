@@ -1210,6 +1210,25 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
             )
             parser.add_argument(
+                "--use-rollout-indexer-replay",
+                action="store_true",
+                default=False,
+                help=(
+                    "Record per-token DSA indexer top-k indices during rollout (vLLM server flag "
+                    "--enable-return-indexer-topk) and replay them during training. Requires "
+                    "--rollout-indexer-topk-num-streams."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-indexer-topk-num-streams",
+                type=int,
+                default=None,
+                help=(
+                    "Number of DSA indexer layers (num_hidden_layers minus full-attention layers) "
+                    "in the rollout_indexer_topk payload; required to decode its shape."
+                ),
+            )
+            parser.add_argument(
                 "--routing-replay-prefetch-microbatches",
                 type=int,
                 default=1,
@@ -2340,6 +2359,13 @@ def vime_validate_args(args):
         args.use_routing_replay = True
         if args.routing_replay_prefetch_microbatches < 0:
             raise ValueError("--routing-replay-prefetch-microbatches must be non-negative")
+
+    if getattr(args, "use_rollout_indexer_replay", False):
+        if getattr(args, "rollout_indexer_topk_num_streams", None) is None:
+            raise ValueError(
+                "--use-rollout-indexer-replay requires --rollout-indexer-topk-num-streams "
+                "(num_hidden_layers minus full-attention layers)"
+            )
 
     if args.custom_config_path:
         with open(args.custom_config_path) as f:

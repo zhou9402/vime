@@ -102,6 +102,10 @@ RUN pip install --no-cache-dir "numpy==1.26.4" "scipy==1.17.1" "pyarrow==25.0.1"
 
 # ====================================== Patches ============================================
 
+# NOTE: docker/patch/${PATCH_VERSION}/vllm-indexer-topk.patch (F07-8a, DSA indexer
+# top-k return channel) is CUDA-only for now. It is intentionally NOT applied here:
+# it needs a rebase against the ROCm nightly base before --enable-return-indexer-topk
+# can be used on ROCm images.
 # vLLM is a pip install, so `patch` not `git apply`. These 3 are ROCm-rebased for the
 # nightly base (docker/amd_patch/); the shared docker/patch/ copies are CUDA-only.
 COPY docker/amd_patch/${PATCH_VERSION}/vllm-pull_weights.patch /tmp/vllm-pull_weights.patch

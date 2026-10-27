@@ -81,6 +81,22 @@ def _pad_rollout_top_p_offsets(
     return token_ids, torch.cat([offsets, empty_offsets])
 
 
+def _replay_rows_length(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, TensorRef):
+        return int(value.shape[0])
+    if torch.is_tensor(value):
+        return int(value.shape[0])
+    if isinstance(value, list):
+        if not value:
+            return 0
+        if all(torch.is_tensor(item) for item in value):
+            return sum(int(item.shape[0]) for item in value)
+        return int(torch.as_tensor(value).shape[0])
+    return int(torch.as_tensor(value).shape[0])
+
+
 def _to_int_list(tokens) -> list[int]:
     if tokens is None:
         return []
@@ -142,6 +158,9 @@ class Sample:
     rollout_routed_experts: list[list[int]] | list[torch.Tensor] | torch.Tensor | TensorRef | None = (
         None  # Routed experts from rollout engine
     )
+    # DSA indexer top-k indices from the rollout engine, for indexer replay:
+    # [rows, num_indexer_layers, index_topk] int32; rows align with tokens[1:].
+    rollout_indexer_topk: np.ndarray | torch.Tensor | TensorRef | None = None
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
 
@@ -474,6 +493,69 @@ class Sample:
                         dim=0,
                     )
 
+        # DSA indexer top-k replay (vLLM indexer-topk channel; mirrors routed_experts).
+        # The npy payload preserves its [rows, num_streams, index_topk] shape, so decode
+        # without decode_int32_meta_array's flattening.
+        indexer_topk_raw = meta_info.get("indexer_topk")
+        indexer_topk = None
+        if indexer_topk_raw is not None:
+            if isinstance(indexer_topk_raw, str):
+                import base64
+                import io
+
+                indexer_topk_raw = np.load(
+                    io.BytesIO(base64.b64decode(indexer_topk_raw.encode("ascii"))), allow_pickle=False
+                )
+            indexer_topk = torch.as_tensor(indexer_topk_raw, dtype=torch.int32)
+        if indexer_topk is not None:
+            if args is None:
+                raise ValueError("args is required to decode indexer topk metadata.")
+            indexer_topk_start_len = int(meta_info.get("indexer_topk_start_len", 0) or 0)
+            if indexer_topk_start_len < 0:
+                raise ValueError(
+                    f"VLLM indexer_topk_start_len must be non-negative, got {indexer_topk_start_len}."
+                )
+            num_streams = getattr(args, "rollout_indexer_topk_num_streams", None)
+            if num_streams is None:
+                raise ValueError(
+                    "indexer_topk received but --rollout-indexer-topk-num-streams is unset "
+                    "(number of DSA indexer layers, e.g. num_hidden_layers minus full-attention layers)."
+                )
+            expected_rows = max(0, len(self.tokens) - 1 - indexer_topk_start_len)
+            indexer_topk = indexer_topk.reshape(-1, *indexer_topk.shape[-2:]) if indexer_topk.ndim > 3 else indexer_topk
+            if indexer_topk.ndim != 3:
+                raise ValueError(
+                    f"VLLM indexer_topk must be 3-D [rows, num_streams, index_topk], got shape {tuple(indexer_topk.shape)}."
+                )
+            if indexer_topk.shape[0] != expected_rows or indexer_topk.shape[1] != num_streams:
+                raise ValueError(
+                    "VLLM indexer_topk shape does not match sample tokens: "
+                    f"got={tuple(indexer_topk.shape)}, expected rows={expected_rows}, streams={num_streams} "
+                    f"(tokens={len(self.tokens)}, indexer_topk_start_len={indexer_topk_start_len})."
+                )
+            if indexer_topk_start_len == 0:
+                self.rollout_indexer_topk = indexer_topk
+            else:
+                existing_len = self.get_rollout_indexer_topk_length()
+                if existing_len == 0:
+                    raise ValueError(
+                        "Cannot append partial indexer topk without existing indexer topk "
+                        f"(indexer_topk_start_len={indexer_topk_start_len})."
+                    )
+                if existing_len < indexer_topk_start_len:
+                    raise ValueError(
+                        "Existing indexer topk shorter than indexer_topk_start_len: "
+                        f"existing_rows={existing_len}, indexer_topk_start_len={indexer_topk_start_len}."
+                    )
+                if existing_len == indexer_topk_start_len:
+                    self._append_rollout_indexer_topk_chunk(indexer_topk)
+                else:
+                    existing = self.materialize_rollout_indexer_topk(replace=False)
+                    self.rollout_indexer_topk = torch.cat(
+                        [existing[:indexer_topk_start_len], indexer_topk],
+                        dim=0,
+                    )
+
         if not update_terminal_info or "finish_reason" not in meta_info:
             return
 
@@ -505,6 +587,36 @@ class Sample:
             existing.append(routed_experts)
         else:
             self.rollout_routed_experts = [torch.as_tensor(existing, dtype=routed_experts.dtype), routed_experts]
+
+    def _append_rollout_indexer_topk_chunk(self, indexer_topk: torch.Tensor) -> None:
+        existing = self.rollout_indexer_topk
+        if existing is None:
+            self.rollout_indexer_topk = indexer_topk
+        elif isinstance(existing, TensorRef):
+            self.rollout_indexer_topk = [existing.load(), indexer_topk]
+        elif isinstance(existing, list) and all(torch.is_tensor(item) for item in existing):
+            existing.append(indexer_topk)
+        else:
+            self.rollout_indexer_topk = [torch.as_tensor(existing, dtype=indexer_topk.dtype), indexer_topk]
+
+    def get_rollout_indexer_topk_length(self) -> int:
+        return _replay_rows_length(self.rollout_indexer_topk)
+
+    def materialize_rollout_indexer_topk(self, *, replace: bool = True) -> torch.Tensor | None:
+        indexer_topk = self.rollout_indexer_topk
+        if indexer_topk is None:
+            return None
+        if isinstance(indexer_topk, TensorRef):
+            tensor = indexer_topk.load()
+        elif isinstance(indexer_topk, list):
+            tensor = torch.cat(
+                [item if torch.is_tensor(item) else torch.as_tensor(item) for item in indexer_topk], dim=0
+            )
+        else:
+            tensor = torch.as_tensor(indexer_topk)
+        if replace:
+            self.rollout_indexer_topk = tensor
+        return tensor
 
     def get_rollout_routed_experts_length(self) -> int:
         routed_experts = self.rollout_routed_experts

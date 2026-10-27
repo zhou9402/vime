@@ -17,3 +17,13 @@ vime ports miles' day-0 model coverage as Megatron training-side plugins under
 
 Tests: `tests/plugins/test_dsv4_ops.py`, `test_dsv4_thd.py`, `test_dsv4_cp_row_balance.py`
 (CPU); `test_dsv4_indexer_cp_balance.py` (torchrun, GPU).
+
+## DSA indexer top-k replay (rollout → trainer)
+
+With `--use-rollout-indexer-replay` plus `--rollout-indexer-topk-num-streams <L>` (indexer
+layers = hidden layers minus full-attention layers), the vLLM server (started with
+`--enable-return-indexer-topk`, see `docker/patch/latest/vllm-indexer-topk.patch`) returns
+per-token indexer top-k indices as a base64 `.npy` blob on the generate choice; vime decodes
+them onto `Sample.rollout_indexer_topk` (`[rows, num_streams, index_topk]` int32, rows =
+`tokens[1:]`) for the trainer-side `IndexerReplayManager` (`vime/utils/replay_base.py`).
+ROCm images do not carry the vLLM patch yet (needs a rebase against the ROCm nightly base).

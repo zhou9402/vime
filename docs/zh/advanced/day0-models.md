@@ -17,3 +17,13 @@ vime 将 miles 的 day-0 模型覆盖移植为 Megatron 训练侧插件，位于
 
 测试：`tests/plugins/test_dsv4_ops.py`、`test_dsv4_thd.py`、`test_dsv4_cp_row_balance.py`
 （CPU）；`test_dsv4_indexer_cp_balance.py`（torchrun，GPU）。
+
+## DSA indexer top-k 回放（rollout → trainer）
+
+使用 `--use-rollout-indexer-replay` 和 `--rollout-indexer-topk-num-streams <L>`（indexer 层数
+= 隐藏层数减去全注意力层数），vLLM server（以 `--enable-return-indexer-topk` 启动，见
+`docker/patch/latest/vllm-indexer-topk.patch`）会在 generate choice 上以 base64 `.npy`
+返回逐 token 的 indexer top-k 索引；vime 解码到 `Sample.rollout_indexer_topk`
+（`[rows, num_streams, index_topk]` int32，rows = `tokens[1:]`），供训练侧的
+`IndexerReplayManager`（`vime/utils/replay_base.py`）使用。ROCm 镜像尚未包含该 vLLM patch
+（需要针对 ROCm nightly base 做 rebase）。

@@ -270,6 +270,9 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
         if last_choice.get("routed_experts") is not None:
             raw = base64.b64decode(last_choice["routed_experts"].encode("ascii"), validate=True)
             meta["routed_experts"] = np.load(io.BytesIO(raw), allow_pickle=False)
+        if last_choice.get("indexer_topk") is not None:
+            raw = base64.b64decode(last_choice["indexer_topk"].encode("ascii"), validate=True)
+            meta["indexer_topk"] = np.load(io.BytesIO(raw), allow_pickle=False)
         # tokens already accumulated above; finalize metadata only (no token re-append).
         if weight_version is not None and call_tokens:
             sample.weight_versions.append(weight_version)
