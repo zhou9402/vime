@@ -322,6 +322,40 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
+        # low-precision rollout/training (FP8/MXFP8/NVFP4)
+        def add_low_precision_arguments(parser):
+            parser.add_argument(
+                "--extra-high-precision-layers-hf",
+                nargs="*",
+                default=(),
+                help=(
+                    "HF name substrings of layers that must stay in high precision "
+                    "in converted low-precision checkpoints (FP8/MXFP8/NVFP4)."
+                ),
+            )
+            parser.add_argument(
+                "--extra-high-precision-layers-megatron",
+                nargs="*",
+                default=(),
+                help=(
+                    "Megatron name substrings of layers whose live weight-sync export "
+                    "must stay in high precision (BF16) even for quantized rollouts."
+                ),
+            )
+            parser.add_argument(
+                "--num-layers-at-start-in-bf16",
+                type=int,
+                default=0,
+                help="Keep the first N decoder layers in BF16 in low-precision rollout weight exports.",
+            )
+            parser.add_argument(
+                "--num-layers-at-end-in-bf16",
+                type=int,
+                default=0,
+                help="Keep the last N decoder layers in BF16 in low-precision rollout weight exports.",
+            )
+            return parser
+
         # rollout
         def add_rollout_arguments(parser):
             parser.add_argument(
@@ -1779,6 +1813,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
         parser = add_cluster_arguments(parser)
         parser = add_train_arguments(parser)
+        parser = add_low_precision_arguments(parser)
         parser = add_rollout_arguments(parser)
         parser = add_fault_tolerance_arguments(parser)
         parser = add_data_arguments(parser)

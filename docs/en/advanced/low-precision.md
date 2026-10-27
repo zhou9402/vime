@@ -151,3 +151,15 @@ For multi-node environments, start the Ray service according to your cluster con
 used as the deterministic oracle for all low-precision quantizers; the
 contract is pinned by `tests/test_low_precision_quant_ref.py` (CPU,
 `python -m pytest tests/test_low_precision_quant_ref.py -x -q`).
+
+## MXFP8 (Blackwell only)
+
+MXFP8 uses E4M3 values with UE8M0 (power-of-two, uint8) scales per 32-element
+group. Train with Megatron's `--fp8-recipe mxfp8` and convert/point
+`--hf-checkpoint` at an MXFP8 HF checkpoint (`tools/convert_hf_to_mxfp8.py`);
+live weight sync then re-quantizes exported weights via
+`megatron_to_hf/processors/quantizer_mxfp8.py`. Note the scale tensor is named
+`weight_scale` (vLLM `ModelOptMxFp8Config` contract), not `weight_scale_inv`.
+Use `--extra-high-precision-layers-hf` / `--extra-high-precision-layers-megatron`
+to keep selected layers in BF16. MXFP8 requires Blackwell (SM100+) and has no
+ROCm support.

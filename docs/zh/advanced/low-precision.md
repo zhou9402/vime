@@ -150,3 +150,14 @@ bash scripts/low_precision/run-kimi-k2-Thinking-int4.sh
 E4M3 块缩放的 NVFP4、块 FP8 反量化），作为所有低精度量化器的确定性
 数值基准；契约由 `tests/test_low_precision_quant_ref.py` 锁定（CPU，
 `python -m pytest tests/test_low_precision_quant_ref.py -x -q`）。
+
+## MXFP8（仅 Blackwell）
+
+MXFP8 使用 E4M3 数值与每 32 元素一组的 UE8M0（2 的幂，uint8）缩放。
+训练侧使用 Megatron 的 `--fp8-recipe mxfp8`，并将 `--hf-checkpoint` 指向
+MXFP8 HF checkpoint（`tools/convert_hf_to_mxfp8.py` 转换）；权重同步时由
+`megatron_to_hf/processors/quantizer_mxfp8.py` 对导出权重重新量化。注意缩放
+张量命名为 `weight_scale`（vLLM `ModelOptMxFp8Config` 约定），而非
+`weight_scale_inv`。可用 `--extra-high-precision-layers-hf` /
+`--extra-high-precision-layers-megatron` 让指定层保持 BF16。MXFP8 仅支持
+Blackwell（SM100+），不支持 ROCm。
