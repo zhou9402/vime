@@ -660,6 +660,32 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "None (default) disables the filter. Mirrors miles --max-weight-staleness."
                 ),
             )
+            parser.add_argument(
+                "--async-unused-samples-handler",
+                type=str,
+                default=None,
+                choices=["retry", "drop"],
+                help=(
+                    "Fully-async rollout only: what to do with a finished group training will not consume "
+                    "(aborted, or beyond --max-weight-staleness). retry recycles it into the data source "
+                    "(stale groups are reset to their prompt first); drop discards it. "
+                    "Default: retry for aborted groups (vime's historical behavior), drop for stale groups "
+                    "(miles parity). Mirrors miles --async-unused-samples-handler."
+                ),
+            )
+            parser.add_argument(
+                "--async-capacity-factor",
+                type=float,
+                default=None,
+                help=(
+                    "Fully-async rollout only: cap generation look-ahead to int(factor * "
+                    "rollout_batch_size) finished+in-flight groups. The cap must cover "
+                    "max(rollout_batch_size, concurrency) so warmup cannot starve. "
+                    "None (default) keeps the existing concurrency-based backpressure. "
+                    "Counterpart of miles --async-data-buffer-capacity-factor (miles caps its in-memory "
+                    "buffer; vime caps queue look-ahead instead)."
+                ),
+            )
             return parser
 
         def add_fault_tolerance_arguments(parser):
@@ -2411,6 +2437,16 @@ def vime_validate_args(args):
             raise ValueError("--max-weight-staleness must be >= 0.")
         if "fully_async" not in args.rollout_function_path:
             raise ValueError("--max-weight-staleness requires fully-async rollout.")
+    if getattr(args, "async_unused_samples_handler", None) is not None:
+        if "fully_async" not in args.rollout_function_path:
+            raise ValueError("--async-unused-samples-handler requires fully-async rollout.")
+    if getattr(args, "async_capacity_factor", None) is not None:
+        if args.async_capacity_factor < 1.0:
+            raise ValueError(
+                "--async-capacity-factor must be >= 1.0 so the cap covers at least one training batch."
+            )
+        if "fully_async" not in args.rollout_function_path:
+            raise ValueError("--async-capacity-factor requires fully-async rollout.")
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

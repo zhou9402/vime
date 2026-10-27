@@ -77,6 +77,10 @@ $$K=\left\lfloor\frac{CE}{G}\right\rfloor$$
 
 `--max-weight-staleness N`（仅 fully async，默认关闭）把排序升级为硬上界：drain 时，若某组相对当前 serving 版本的 staleness 超过 $N$，该组被丢弃并补新组，计数见 `rollout/staleness/dropped_groups`。上界为含等值判断，不考虑 prompt KV 的过期；权重版本不可解析的组一律保留。object-store 传输下，检查发生在 manager 排空 worker 输出队列时；straw 传输下，检查发生在分布式调度器收集组时，依据发布时记录在 `RolloutGroupRef` 上的最老版本摘要。
 
+`--async-unused-samples-handler {retry,drop}` 决定训练不再消费的已完成组（aborted，或超过 `--max-weight-staleness`）的去向：`retry` 将其回收到同一队列（stale 组先重置为 prompt，以便用新权重重新生成；aborted 组保留已有 partial 续写），`drop` 经 transport 的 release/reject 路径丢弃。未设置时按原因取默认：aborted 默认 retry（vime 既有行为），stale 默认 drop（与 miles 一致）。retry 计数见 `rollout/staleness/retried_groups`。
+
+`--async-capacity-factor F`（默认关闭）把生成侧的领先量限制在 $\lfloor F \cdot B \rfloor$ 个「已完成 + 在途」组，其中 $B$ 为 `rollout_batch_size`。启动时校验该上限不得小于 $\max(B, \text{并发度})$，以免 warmup 饥饿。它对应 miles 的 `--async-data-buffer-capacity-factor`；vime 限制的是队列领先量而非内存 buffer。
+
 若 producer 每秒稳定产出 $\lambda$ 个被接受的组，训练每秒消费 $\mu$ 个，吞吐上限为 $\min(\lambda,\mu)$。当 $\lambda>\mu$，无限队列约以 $\lambda-\mu$ 的速度增长，需要 backpressure。稳定队列按 Little 定律有 $L=\lambda W_q$，其中 $L$ 是平均排队组数、$W_q$ 是平均队内时间。只有其他环节吃得下，增加 producer 才有用。
 
 同时观察 `staleness/mean`、`staleness/max`、有效组吞吐、reward、mask/clip 比例及训推 log-prob 差异。Off-policy 修正不保证任意延迟都无害。[系统耗时推导](rl-systems.md#async)与 [PipelineRL 论文](https://arxiv.org/abs/2509.19128)可作为流水线背景，实际行为以上述 vime 实现为准。

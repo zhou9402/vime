@@ -116,7 +116,8 @@ def test_drain_drops_stale_groups_and_refills(monkeypatch):
     monkeypatch.setattr(fa, "_get_worker", lambda args, data_buffer: worker)
     discarded = []
     monkeypatch.setattr(
-        fa, "discard_rollout_group", lambda group, args, reason, *, controller=None: discarded.append((group, reason))
+        "vime.rollout.async_policy.discard_rollout_group",
+        lambda group, args, reason, *, controller=None: discarded.append((group, reason)),
     )
     args = SimpleNamespace(
         rollout_batch_size=4,
@@ -140,8 +141,7 @@ def test_drain_without_staleness_flag_keeps_everything(monkeypatch):
     groups = [[_sample(0, ["1"])], [_sample(1, ["10"])]]
     monkeypatch.setattr(fa, "_get_worker", lambda args, data_buffer: _FakeWorker(groups))
     monkeypatch.setattr(
-        fa,
-        "discard_rollout_group",
+        "vime.rollout.async_policy.discard_rollout_group",
         lambda *a, **k: pytest.fail("no group may be discarded without --max-weight-staleness"),
     )
     args = SimpleNamespace(

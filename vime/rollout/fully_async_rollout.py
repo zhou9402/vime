@@ -37,6 +37,7 @@ import time
 from vime.data.transport import discard_rollout_group, publish_rollout_async
 from vime.rollout.base_types import RolloutFnTrainOutput, finalize_rollout_groups
 from vime.rollout.filter_hub.base_types import call_dynamic_filter
+from vime.rollout.async_policy import UnusedReason, async_capacity_limit, handle_unused_group
 from vime.rollout.sample_hooks import current_rollout_weight_version
 from vime.rollout.vllm_rollout import GenerateState, generate_and_rm_group
 from vime.utils.async_utils import run
@@ -85,6 +86,14 @@ class AsyncRolloutWorker:
         self.args = args
         self.data_buffer = data_buffer
         self.concurrency = max(1, concurrency // getattr(args, "n_samples_per_prompt", 1))
+        self.capacity_limit = async_capacity_limit(args)
+        if self.capacity_limit is not None:
+            floor = max(getattr(args, "rollout_batch_size", 1), self.concurrency)
+            if self.capacity_limit < floor:
+                raise ValueError(
+                    f"--async-capacity-factor gives a cap of {self.capacity_limit} groups, below the "
+                    f"warmup floor max(rollout_batch_size, concurrency)={floor}; raise the factor."
+                )
         self.running = True
         self.paused = False
         self.condition = threading.Condition()
@@ -195,10 +204,12 @@ class AsyncRolloutWorker:
 
                 # Top up. The qsize gate is the queue's backpressure: once a
                 # full pool of completed groups is waiting, stop pulling new
-                # prompts until the training side drains some.
+                # prompts until the training side drains some. With
+                # --async-capacity-factor the gate widens/narrows to the cap.
+                queue_limit = self.capacity_limit or max_concurrent
                 while (
                     len(active_tasks) < max_concurrent
-                    and self.output_queue.qsize() < max_concurrent
+                    and self.output_queue.qsize() < queue_limit
                     and self.running
                     and not self.paused
                 ):
@@ -255,12 +266,16 @@ class AsyncRolloutWorker:
                     type(result).__name__,
                 )
                 return
-            # Aborted group → requeue, don't ship to training.
+            # Aborted groups go to the unused-samples handler: retry requeues
+            # (partial continuation), drop discards instead of shipping to
+            # training.
             if any(getattr(s, "status", None) == Sample.Status.ABORTED for s in result):
                 try:
-                    self.data_buffer.add_samples([result])
+                    handle_unused_group(
+                        self.args, result, UnusedReason.ABORTED, data_source=self.data_buffer
+                    )
                 except Exception:  # noqa: BLE001
-                    logger.exception("fully-async: failed to requeue aborted group")
+                    logger.exception("fully-async: failed to handle aborted group")
                 return
             self.output_queue.put((gid, result))
 
@@ -288,6 +303,7 @@ async def _generate_rollout_async(
     collected = []
     dropped_count = 0
     stale_dropped = 0
+    stale_retried = 0
     drop_reasons: dict[str, int] = {}
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path)
@@ -309,14 +325,16 @@ async def _generate_rollout_async(
             # Staleness is judged at drain time against the version the
             # trainer is about to train on (miles: get-time ``_drop_stale``).
             if group_is_stale(group, current_weight_version, max_weight_staleness):
-                await asyncio.to_thread(
-                    discard_rollout_group,
-                    group,
+                disposition = await asyncio.to_thread(
+                    handle_unused_group,
                     args,
-                    "stale",
+                    group,
+                    UnusedReason.STALE,
+                    data_source=data_buffer,
                     controller=getattr(data_buffer, "controller", None),
                 )
-                stale_dropped += 1
+                stale_dropped += disposition == "drop"
+                stale_retried += disposition == "retry"
                 continue
             verdict = call_dynamic_filter(dynamic_filter, args, group)
             if verdict.keep:
@@ -368,6 +386,7 @@ async def _generate_rollout_async(
     metrics["rollout/dynamic_filter/dropped_ratio"] = dropped_count / (len(collected) + dropped_count)
     if max_weight_staleness is not None:
         metrics["rollout/staleness/dropped_groups"] = stale_dropped
+        metrics["rollout/staleness/retried_groups"] = stale_retried
         metrics["rollout/staleness/max_weight_staleness"] = max_weight_staleness
     metrics_enabled = filters_enabled or max_weight_staleness is not None
     if args.rollout_sample_filter_path is not None:

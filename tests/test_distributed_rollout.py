@@ -35,6 +35,51 @@ except ImportError:
     sys.modules["vllm_router"] = SimpleNamespace(__version__="0.3.0")
 
 
+def test_retried_group_keeps_valid_lease_after_resume(source_factory):
+    """B5b: a group recycled by the unused-samples retry handler re-enters the
+    same queue and is re-delivered with a valid lease after a controller
+    restart (checkpoint resume)."""
+    from straw.protocol import Lease
+
+    from vime.rollout.async_policy import reset_group_for_retry
+
+    reader = source_factory("producer")
+    [group] = reader.get_samples(1)
+    sample = group[0]
+    # Simulate a stale generated group: content exists, then the handler
+    # resets it to its prompt and requeues it into the same queue.
+    sample.tokens = [1, 2, 3]
+    sample.response_length = 1
+    sample.reward = 1.0
+    sample.status = Sample.Status.COMPLETED
+    sample.weight_versions = ["0"]
+    reset_group_for_retry(group)
+    reader.add_samples([group])
+    reader.close()
+    controller = source_factory.controller
+    controller.close()
+
+    args = copy.copy(source_factory.args)
+    restored = RolloutQueueController(args, restore_plan=RestorePlan(mode="resume"))
+    try:
+        reader2 = QueueReader(copy.copy(args), _LocalHandle(restored), "producer-2", 7)
+        try:
+            recycled = None
+            for _ in range(8):  # 7 dataset prompts + 1 recycled
+                [candidate] = reader2.get_samples(1)
+                if candidate[0].prompt == sample.prompt:
+                    recycled = candidate
+                    break
+            assert recycled is not None, "retried prompt vanished across resume"
+            lease = recycled[0]._queue_lease
+            assert lease["task_id"] and lease["attempt_id"]
+            assert restored.heartbeat([Lease(**lease)]) == ["extended"]
+        finally:
+            reader2.close()
+    finally:
+        restored.close()
+
+
 class _LocalHandle:
     def __init__(self, target):
         self.target = target

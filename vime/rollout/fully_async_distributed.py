@@ -24,9 +24,16 @@ from vime.data.transport import (
 from vime.observability import logging_utils
 from vime.observability.rollout_data_utils import validate_rollout_id_annotated
 from vime.ray.utils import add_default_ray_env_vars
+from vime.rollout.async_policy import (
+    UnusedReason,
+    async_capacity_limit,
+    prompt_retry_stubs,
+    reset_group_for_retry,
+    unused_samples_handler,
+)
 from vime.rollout.base_types import finalize_rollout_groups, iter_samples
 from vime.rollout.filter_hub.base_types import DynamicFilterOutput, call_dynamic_filter
-from vime.rollout.sample_hooks import rollout_context
+from vime.rollout.sample_hooks import current_rollout_weight_version, rollout_context
 from vime.utils.async_utils import get_async_loop
 from vime.utils.http_utils import get_rollout_num_engines, init_http_client
 from vime.utils.misc import load_function
@@ -160,6 +167,8 @@ class RolloutScheduler:
                 self.condition.notify_all()
 
     def generate(self, rollout_id, *, prefetch, current_weight_version=None):
+        if current_weight_version is None:
+            current_weight_version = current_rollout_weight_version()
         groups = []
         dropped_count = 0
         stale_dropped = 0
@@ -176,6 +185,10 @@ class RolloutScheduler:
             self.rollout_id = rollout_id
             self.demand = self.args.rollout_batch_size
             self.prefetch = min(prefetch, self.capacity)
+            capacity_limit = async_capacity_limit(self.args)
+            if capacity_limit is not None:
+                # Outstanding finished+inflight groups never exceed the cap.
+                self.prefetch = min(self.prefetch, max(0, capacity_limit - self.demand))
             self.paused = False
             if self.thread is None:
                 self.thread = threading.Thread(target=self._run, name="rollout-collect", daemon=True)
@@ -192,10 +205,9 @@ class RolloutScheduler:
                 # the trainer is about to train on; over-limit groups are
                 # discarded and replaced, like dynamic-filter rejects.
                 if verdict.keep and group_is_stale(group, current_weight_version, max_weight_staleness):
-                    # Discard after the lock is released: rejection talks to
-                    # the controller actor, and the collector shares this lock.
+                    # Dispose after the lock is released: the handler talks to
+                    # the controller/data source, and the collector shares this lock.
                     stale_groups.append(group)
-                    stale_dropped += 1
                     self.condition.notify_all()
                     continue
                 # Fully async continuously replaces rejected groups. The
@@ -211,13 +223,36 @@ class RolloutScheduler:
                     self.demand -= 1
                 self.condition.notify_all()
 
+        stale_retried = 0
+        handler = unused_samples_handler(self.args, UnusedReason.STALE)
         for group in stale_groups:
-            discard_rollout_group(group, self.args, "stale", controller=self.controller)
+            if handler == "retry":
+                data_source = getattr(self, "data_source", None)
+                if data_source is None:
+                    raise ValueError(
+                        "--async-unused-samples-handler=retry for stale groups needs a requeueable data source"
+                    )
+                # Recycle the prompt (not the stale content) back into the queue.
+                if isinstance(group, DiskPayloadRef):
+                    # The payload holds the prompts, so one load is
+                    # unavoidable; keep only prompt-only stubs and drop the
+                    # heavy generated artifacts with the payload reference.
+                    retry_group = prompt_retry_stubs(group.load())
+                else:
+                    reset_group_for_retry(group)
+                    retry_group = group
+                data_source.add_samples([retry_group])
+                stale_retried += 1
+            else:
+                stale_dropped += 1
+            # Either way the stale payload's publications are released.
+            discard_rollout_group(group, self.args, UnusedReason.STALE.value, controller=self.controller)
         metrics = {f"rollout/dynamic_filter/drop_{reason}": count for reason, count in drop_reasons.items()}
         metrics["rollout/dynamic_filter/dropped_groups"] = dropped_count
         metrics["rollout/dynamic_filter/dropped_ratio"] = dropped_count / (len(groups) + dropped_count)
         if max_weight_staleness is not None:
             metrics["rollout/staleness/dropped_groups"] = stale_dropped
+            metrics["rollout/staleness/retried_groups"] = stale_retried
             metrics["rollout/staleness/max_weight_staleness"] = max_weight_staleness
         # Publish a manifest of group references outside the scheduler lock.
         return finalize_rollout_groups(self.args, rollout_id, groups, metrics, controller=self.controller)
@@ -380,7 +415,16 @@ class _GenerationActor:
         validate_rollout_id_annotated([group])
         samples = list(iter_samples(group))
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
-            await self._rebuffer(group)
+            if unused_samples_handler(self.args, UnusedReason.ABORTED) == "retry":
+                await self._rebuffer(group)
+            else:
+                await asyncio.to_thread(
+                    discard_rollout_group,
+                    group,
+                    self.args,
+                    UnusedReason.ABORTED.value,
+                    controller=getattr(self.data_source, "controller", None),
+                )
             return None
         for sample in samples:
             if sample.index is None:
@@ -554,7 +598,15 @@ class DistributedRollout(RolloutScheduler):
                 ray.kill(worker)
             raise
         super().__init__(args, workers, capacities, controller=data_source.controller)
+        self.data_source = data_source
         self.reader_ids = reader_ids
+        capacity_limit = async_capacity_limit(args)
+        if capacity_limit is not None and capacity_limit < max(args.rollout_batch_size, self.capacity):
+            raise ValueError(
+                f"--async-capacity-factor gives a cap of {capacity_limit} groups, below the warmup floor "
+                f"max(rollout_batch_size, concurrency)={max(args.rollout_batch_size, self.capacity)}; "
+                "raise the factor."
+            )
         self.ready.extend(recovered)
         logging.getLogger(__name__).info(
             "Fully-async rollout: %d nodes, dataset=%d, concurrency=%d",
