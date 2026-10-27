@@ -13,3 +13,5 @@ vime 正在从 miles 移植 LoRA 支持（`miles@ba28991834`，移植编号 F04�
 - **F04-2**：新增 CLI 参数（`--lora-rank/--lora-alpha/--lora-dropout/--lora-a-init-method/--lora-type/--target-modules/--exclude-modules/--lora-adapter-path/--lora-sync-from-tensor/--lora-base-cpu-backup/--lora-train-only/--experts-shared-outer-loras/--check-lora-weight-equal`，经 `vime/utils/arguments.py` 的 `add_lora_arguments`），以及 `vime/utils/lora/arguments.py` 校验逻辑和移植的 `vime/utils/hf_utils/`（`load_hf_config`、`HfWeightMapping`）。第一阶段仅支持 attention + 稠密 MLP LoRA——expert 投影与 multi-LoRA 会被明确报错拒绝。
 
 - **F04-3a**：native LoRA 核心——`vime/backends/megatron_utils/lora/native/{config,distributed,naming}.py` 与 `spec/base.py`（`LoRAConfig`、TP=1 直通即可运行的 TP/EP/SP 通信辅助、`ConverterNaming`/`DeclaredNaming`，经新增的 `megatron_to_hf.convert_to_hf_names` 桥接、架构 spec 契约）。测试：`tests/backends/megatron_utils/lora/native/test_core.py`。
+
+- **F04-3b**：native LoRA 模块——`native/modules/linear.py`（`NativeLoRAAdapter`、`LoRALinear`、`LoRASplitQKV`/`FC1`、forward hook 挂接）、`native/modules/lm_head.py`、`native/spec/layout.py`（模块布局/fused attach）。测试：`test_modules.py`（QKV 排列、初始化分布、fused-norm 宿主契约）。
